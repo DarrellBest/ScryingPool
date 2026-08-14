@@ -434,25 +434,33 @@ def _write(
 
 
 def describe_one(cfg: Config, image_path: str) -> tuple[dict, list[str]]:
-    """One artwork: call, parse, validate, retry once. Raises ValueError if both fail."""
+    """One artwork: call, parse, validate, retry once. Raises if both attempts fail.
+
+    Same image, same prompt on the retry, plus a terse corrective line when the first
+    answer was structurally bad. A transport or server error retries the call without
+    that line: an HTTP status is not a critique of the model's answer, and pasting one
+    into the prompt only makes the second attempt worse.
+    """
     reason: str | None = None
+    last: Exception | None = None
     for attempt in (1, 2):
-        raw = ollama.vision(
-            cfg,
-            cfg.vision_model,
-            prompts.vision_prompt(reason),
-            image_path,
-            format=prompts.VISION_SCHEMA,
-            options=prompts.VISION_OPTIONS,
-        )
         try:
+            raw = ollama.vision(
+                cfg,
+                cfg.vision_model,
+                prompts.vision_prompt(reason),
+                image_path,
+                format=prompts.VISION_SCHEMA,
+                options=prompts.VISION_OPTIONS,
+            )
             return validate(_loads(raw))
-        except ValueError as exc:
-            reason = str(exc)
-            if attempt == 2:
-                raise ValueError(reason) from None
-            print(f"  retrying: {reason}", flush=True)
-    raise AssertionError("unreachable")
+        except ValueError as exc:  # unparseable or structurally invalid response
+            last, reason = exc, str(exc)
+        except Exception as exc:  # HTTP error, unreadable image, connection refused
+            last, reason = exc, None
+        if attempt == 1:
+            print(f"  retrying: {last}", flush=True)
+    raise last if last is not None else ValueError("vision call failed")
 
 
 def run(cfg: Config, limit: int | None = None, backfill_stale: bool = False) -> dict:

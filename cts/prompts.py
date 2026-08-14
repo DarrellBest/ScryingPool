@@ -172,10 +172,13 @@ VISION_SCHEMA: dict = _obj(
 
 # Generation options for the vision call.
 #
-# num_ctx is not decoration. The prompt below plus the encoded image plus a full
-# response runs well past Ollama's default context, and the failure mode is silent:
-# the head of the prompt — every rule in it — is dropped, and the model returns
-# schema-valid mush. Keep this comfortably above prompt + image + output tokens.
+# num_ctx is not decoration. The prompt below is ~3.5k tokens, an art crop costs
+# anywhere from ~400 tokens (patch-merging models) to ~6.4k (tiled models such as
+# llama3.2-vision at four tiles), and the response runs 1.2k to 1.8k. That total blows
+# straight past Ollama's default context, and the failure mode is silent: the head of
+# the prompt — every rule in it — is dropped, and the model returns schema-valid mush
+# for hours. 16k covers the worst case with room to spare; lower it only if VRAM is
+# tight, and re-read a few descriptions afterwards if you do.
 #
 # Temperature is low because the literal layer is the layer that must not drift; the
 # interpretive layer gets its range from the explicit checklist in the prompt, not
@@ -183,7 +186,7 @@ VISION_SCHEMA: dict = _obj(
 VISION_OPTIONS: dict = {
     "temperature": 0.3,
     "top_p": 0.9,
-    "num_ctx": 8192,
+    "num_ctx": 16384,
     "num_predict": 3000,
 }
 
@@ -206,7 +209,7 @@ cannot be found by anyone searching for lonely art.
 
 People search this index with the whole range at once: "figures with beards",
 "holding something that isn't a weapon", "a single figure against a huge empty
-background", "painterly, muted, almost watercolour", "looks lonely", "the moment right
+background", "painterly, muted, almost watercolor", "looks lonely", "the moment right
 before a betrayal", "would fit on a black metal album cover". One description has to
 serve all of it. That is why you write two layers.
 
@@ -232,20 +235,20 @@ RULES FOR THE LITERAL LAYER
 1. Describe only what is visible in this image. Not what is probably just outside the
    frame, not what usually accompanies such a scene.
 2. Name nothing. No character names, no place names, no story, no world, no franchise,
-   no artist, no title. If you think you recognise the picture, describe it anyway as
+   no artist, no title. If you think you recognize the picture, describe it anyway as
    though you have never seen it before. Recognition is the single most common way
    this task is failed: it replaces what is actually painted with what you remember.
 3. Never state an emotion, intention, or relationship. State the visible evidence for
    it instead. Not "looks furious" but "brows drawn low, teeth bared, fist clenched".
    Not "protecting the child" but "stands between the child and the open doorway, arm
    extended sideways".
-4. Be specific in a way a search can use. Name colours precisely ("desaturated slate
-   blue", "warm ochre", "ember orange"), not "colourful" or "dark". Name materials and
+4. Be specific in a way a search can use. Name colors precisely ("desaturated slate
+   blue", "warm ochre", "ember orange"), not "colorful" or "dark". Name materials and
    textures ("hammered bronze", "wet fur", "cracked lacquer"). Count things exactly
    when there are ten or fewer, and estimate above that ("roughly twenty spear tips").
    State where things are: foreground, midground, background, left, right, behind,
    above, in front of.
-5. Describe light explicitly: where it comes from, its colour, how hard the shadows
+5. Describe light explicitly: where it comes from, its color, how hard the shadows
    are, whether anything glows.
 6. If there is writing or a symbol in the image, say where it is and what it looks
    like. Transcribe it only if it is short and unmistakably legible. Never guess at
@@ -275,12 +278,12 @@ there". If you looked but genuinely cannot see it, say so and why, briefly
 because then absence and inattention look the same.
 
   species        Plain visual vocabulary for what kind of being it is: "human",
-                 "elf-like humanoid", "dragon", "skeletal humanoid", "armoured
+                 "elf-like humanoid", "dragon", "skeletal humanoid", "armored
                  insectoid", "wolf". Never a named species from any fiction. If
                  uncertain, say "humanoid" and add the distinguishing features.
-  facial_hair    Be exact; people search this directly. "full grey beard", "short
+  facial_hair    Be exact; people search this directly. "full gray beard", "short
                  black stubble", "long white beard braided with gold rings",
-                 "moustache only". Use "clean-shaven" when a bare humanlike face is
+                 "mustache only". Use "clean-shaven" when a bare humanlike face is
                  visible, "none" when the creature has no such feature at all, and
                  name the obstruction when the face is hidden.
   held_objects   Only what the primary subject is actually holding or supporting —
@@ -292,7 +295,7 @@ because then absence and inattention look the same.
                  severed head, infant or animal is not a weapon, even in a violent
                  scene. If the hands are empty, emit exactly one entry with object
                  "none" and is_weapon false.
-  clothing       Garments, armour, headwear, jewellery: materials, colours, layers,
+  clothing       Garments, armor, headwear, jewelry: materials, colors, layers,
                  condition. "none" if unclothed or if the subject is a bare creature.
   pose           What the body is doing: stance, what each limb does, where the head
                  and gaze point, whether the subject is still or mid-motion, and
@@ -302,17 +305,18 @@ because then absence and inattention look the same.
                  "crowd", "silhouette", "victim". If there are none, emit exactly one
                  entry with species "none" and role "none".
   figure_count   Every living being in the image including the primary subject and
-                 including animals. 0 if none.
+                 including animals. Count exactly up to ten and estimate above
+                 that. 0 if none.
   setting        Where this is: terrain, structures, interior or exterior, weather,
                  notable objects in the environment.
   time_of_day    "day", "dawn", "dusk", "night", "indoors, artificial light", or
                  "indeterminate" — plus the light evidence in a few words.
-  palette        Three to eight precise colour terms, dominant first.
+  palette        Three to eight precise color terms, dominant first.
   art_style      Medium, technique and finish, since people search this directly:
                  "oil painting, heavy impasto, warm varnish", "digital painting,
                  painterly, visible brushwork", "ink linework with flat cel shading",
                  "woodcut-like hard black shapes", "photoreal rendering, smooth
-                 gradients", "muted watercolour with wet edges".
+                 gradients", "muted watercolor with wet edges".
   composition    Framing (close-up, medium, full figure, wide), where the subject sits
                  in the frame, depth layers, negative space, camera height, symmetry,
                  leading lines. Phrases like "one small figure against a vast empty
@@ -325,14 +329,14 @@ Each one is indexed and retrieved on its own, so each must survive alone.
 * Atomic. One fact per statement.
 * Self-contained. Name what you are talking about: "the primary figure", "a
   background figure", "the sky", "the left hand". Never use he, she, it, they, this,
-  that, the same, or also. "has a full grey beard" is fine; "he has one" is useless.
+  that, the same, or also. "has a full gray beard" is fine; "he has one" is useless.
 * No cross-references. Each statement stands without the one before it.
 * No repetition. Every statement must add information the others do not carry.
 * Collectively exhaustive. Between them, cover: the primary subject's body, face and
-  expression-evidence, hair, held objects, clothing and armour; each other figure;
+  expression-evidence, hair, held objects, clothing and armor; each other figure;
   animals; architecture and terrain; the sky and weather; the light source and its
   direction; notable small objects; anything unusual, damaged, or out of place.
-* No names, no lore, no mood, no judgement of quality.
+* No names, no lore, no mood, no judgment of quality.
 
 INTERPRETIVE PROPOSITIONS: 8 TO 15 OF THEM
 
@@ -370,15 +374,15 @@ behind her, fog over the water, an unlit ferris wheel on the far shore.
 Good literal propositions:
   "the primary figure wears a red oilskin coat that reaches mid-calf"
   "the primary figure holds a lit paper lantern in the right hand at waist height"
-  "a large black dog sits on the planks roughly two metres behind the primary figure"
-  "the pier is built from weathered grey planks with visible gaps between them"
-  "an unlit ferris wheel stands on the far shore, greyed by fog"
+  "a large black dog sits on the planks roughly two meters behind the primary figure"
+  "the pier is built from weathered gray planks with visible gaps between them"
+  "an unlit ferris wheel stands on the far shore, muted to gray by fog"
   "the sky graduates from pale apricot at the horizon to slate blue overhead"
 
 Bad literal propositions, and why:
   "she is waiting for someone"          - a story, not a fact, and starts with a pronoun
   "the pier feels abandoned"            - a feeling; belongs in the other layer
-  "a beautiful seaside scene"           - a judgement, and carries no information
+  "a beautiful seaside scene"           - a judgment, and carries no information
   "holds it up high"                    - meaningless on its own
 
 Abbreviated slots for the same image (yours must be complete):
@@ -390,14 +394,14 @@ Abbreviated slots for the same image (yours must be complete):
   "other_figures": [{"species": "dog", "role": "companion, midground"}],
   "figure_count": 2,
   "time_of_day": "dusk, low warm light from the left, long soft shadows",
-  "palette": ["slate blue", "pale apricot", "signal red", "wet grey"],
-  "composition": "wide shot, small figure left of centre in the lower third, large
+  "palette": ["slate blue", "pale apricot", "signal red", "wet gray"],
+  "composition": "wide shot, small figure left of center in the lower third, large
    empty sky, the pier a strong horizontal leading away from the viewer"
 
 Good interpretive propositions:
   "feels quiet and unresolved rather than sad"
   "reads as the last few minutes of someone's patience"
-  "the animal's presence emphasises the solitude rather than relieving it"
+  "the animal's presence emphasizes the solitude rather than relieving it"
   "would sit comfortably on the sleeve of a melancholy synth-pop record"
   "framed like the closing shot of a coming-of-age film"
   "no violence is implied; the whole tension is about arrival and absence"
@@ -406,6 +410,10 @@ Bad interpretive propositions, and why:
   "there is a dog behind her"           - a literal fact in the wrong layer
   "the mood is interesting"             - vague; matches no query
   "possibly somewhat melancholy"        - hedged into uselessness
+
+That example is a different picture, shown only to demonstrate the two registers.
+Nothing from it — no pier, no dog, no lantern, no fog — belongs in your answer unless
+it is genuinely in the image in front of you.
 
 OUTPUT
 

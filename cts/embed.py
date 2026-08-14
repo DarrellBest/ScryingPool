@@ -75,7 +75,7 @@ def run(cfg: Config) -> dict:
             flush=True,
         )
 
-        for start in range(0, len(rows), BATCH_SIZE):
+        for batch_no, start in enumerate(range(0, len(rows), BATCH_SIZE), start=1):
             batch = rows[start : start + BATCH_SIZE]
             try:
                 vecs = ollama.embed(cfg, [row["text"] for row in batch])
@@ -111,7 +111,7 @@ def run(cfg: Config) -> dict:
             )
             conn.commit()
             embedded += len(batch)
-            if embedded % PROGRESS_EVERY < BATCH_SIZE:
+            if batch_no % PROGRESS_EVERY_BATCHES == 0:
                 print(f"embed: {embedded}/{len(rows)}", flush=True)
     finally:
         conn.close()
