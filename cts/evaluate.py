@@ -473,10 +473,10 @@ def _score_marked(
     # Denominator is marks actually given, not 5: an unopened result is unknown,
     # not a miss. n_pending is reported alongside so a thin number is obvious.
     entry["p_at_5"] = round(len(accepted) / len(marked), 4) if marked else None
-    label = "P@5" if row["kind"] == "abstract" else "accepted"
+    label = "P@5" if row["kind"] == "abstract" else "accept rate"
     shown = f"{entry['p_at_5']:.2f}" if entry["p_at_5"] is not None else "--"
     print(
-        f"    {label} {shown}  ({len(accepted)}/{len(marked)} marked, "
+        f"    {label} {shown}  ({len(accepted)} accepted of {len(marked)} marked, "
         f"{entry['n_pending']} pending)   [{elapsed_str(entry)}]"
     )
 
