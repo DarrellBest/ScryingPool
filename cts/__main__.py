@@ -13,30 +13,34 @@ from .config import Config, load_config
 
 
 def _ingest(cfg: Config, args: argparse.Namespace) -> None:
-    from . import art, edhrec, ingest, power
+    # imported in pipeline order, so a missing module names the stage that stops
+    from .ingest import run as run_ingest
+    from .edhrec import run as run_edhrec
+    from .power import run as run_power
+    from .art import run as run_art
 
-    ingest.run(cfg)
-    edhrec.run(cfg)
-    power.run(cfg)
-    art.run(cfg)
+    run_ingest(cfg)
+    run_edhrec(cfg)
+    run_power(cfg)
+    run_art(cfg)
 
 
 def _describe(cfg: Config, args: argparse.Namespace) -> None:
-    from . import describe
+    from .describe import run as run_describe
 
-    describe.run(cfg, limit=args.limit, backfill_stale=args.backfill_stale)
+    run_describe(cfg, limit=args.limit, backfill_stale=args.backfill_stale)
 
 
 def _embed(cfg: Config, args: argparse.Namespace) -> None:
-    from . import embed
+    from .embed import run as run_embed
 
-    embed.run(cfg)
+    run_embed(cfg)
 
 
 def _search(cfg: Config, args: argparse.Namespace) -> None:
-    from . import search
+    from .search import run as run_search
 
-    search.run(
+    run_search(
         cfg,
         args.query,
         band=args.band,
@@ -47,27 +51,27 @@ def _search(cfg: Config, args: argparse.Namespace) -> None:
 
 
 def _refresh(cfg: Config, args: argparse.Namespace) -> None:
-    from . import refresh
+    from .refresh import run as run_refresh
 
-    sys.exit(refresh.run(cfg))
+    sys.exit(run_refresh(cfg))
 
 
 def _eval(cfg: Config, args: argparse.Namespace) -> None:
-    from . import evaluate
+    from .evaluate import run as run_evaluate
 
-    evaluate.run(cfg, collect_prefs=args.collect_prefs)
+    run_evaluate(cfg, collect_prefs=args.collect_prefs)
 
 
 def _synth(cfg: Config, args: argparse.Namespace) -> None:
-    from . import synth
+    from .synth import run as run_synth
 
-    synth.run(cfg, limit=args.limit)
+    run_synth(cfg, limit=args.limit)
 
 
 def _export_training(cfg: Config, args: argparse.Namespace) -> None:
-    from . import export_training
+    from .export_training import run as run_export
 
-    export_training.run(cfg, target=args.target, out=args.out)
+    run_export(cfg, target=args.target, out=args.out)
 
 
 def build_parser() -> argparse.ArgumentParser:
