@@ -72,13 +72,17 @@ def strongest_theme(row: dict) -> dict | None:
     `matched_terms` is the router's mechanical filter (deck archetypes, oracle-text
     keywords). When one of them names a theme this commander has, that theme is the
     relevant one; otherwise fall back to the commander's most popular theme.
+
+    Only `archetypes` is used when it is populated: cts/edhrec.py stores the full tag
+    list in `themes` but keeps `archetypes` as the subset EDHREC actually publishes a
+    /commanders/<slug>/<theme> page for, and a tag without a page is a 404.
     """
-    records = _records(row.get("archetypes")) + _records(row.get("themes"))
+    records = _records(row.get("archetypes")) or _records(row.get("themes"))
     if not records:
         return None
 
     by_slug: dict[str, dict] = {}
-    for rec in records:  # archetypes first, so they win ties on identical slugs
+    for rec in records:
         by_slug.setdefault(rec["slug"], rec)
     ordered = sorted(by_slug.values(), key=lambda r: -r["count"])
 

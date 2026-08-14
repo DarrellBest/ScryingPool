@@ -106,7 +106,11 @@ blend, not a choice: never force the query into one layer. Calibration:
 slot_filters — zero or more hard constraints on the literal layer's structured slots.
 Available paths: {paths}
 Ops: equals, contains, not_contains, gte, lte (gte/lte only on figure_count).
-held_objects, other_figures and palette are lists: use contains.
+held_objects, other_figures and palette are lists: use contains, which matches inside
+their compact JSON. held_objects serializes as
+  [{"object":"lantern","is_weapon":false}]
+so "holding something that isn't a weapon" is contains with value "is_weapon":false,
+and "holding a weapon" is contains with value "is_weapon":true.
 Only add a filter when the query states a requirement that is certain to be recorded in
 that slot, and prefer no filter at all over a shaky one — the retriever already searches
 the full text of every literal statement, while a wrong filter deletes correct answers
@@ -228,7 +232,7 @@ INTERPRETIVE_SYSTEM = (
 
 INTERPRETIVE_PROMPT = """THEME: "{query}"
 
-Write 6 short statements an art critic might write about an image that fits this theme,
+Write 6 to 8 short statements an art critic might write about an image that fits this theme,
 in the interpretive register: what it conveys, what it feels like, what kind of story it
 looks like a frame from, what it evokes by analogy.
 
@@ -254,7 +258,7 @@ VISUAL_SYSTEM = (
 
 VISUAL_PROMPT = """THEME: "{query}"
 
-Write 6 short statements describing what an image matching this theme would PHYSICALLY
+Write 6 to 8 short statements describing what an image matching this theme would PHYSICALLY
 contain. Only what a camera would record: figures and their species, facial hair, held
 objects, clothing, posture, setting, lighting, colours, composition.
 

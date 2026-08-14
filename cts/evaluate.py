@@ -301,7 +301,11 @@ def run(cfg: Config, collect_prefs: bool = False) -> dict:
     }
     _print_header(header)
 
-    from .search import execute as search_execute
+    try:
+        from .search import execute as search_execute
+    except ImportError as exc:
+        print(f"error: cannot import cts.search ({exc}) — nothing to evaluate.", file=sys.stderr)
+        raise SystemExit(1) from None
 
     per_query: list[dict] = []
     errors: list[dict] = []
