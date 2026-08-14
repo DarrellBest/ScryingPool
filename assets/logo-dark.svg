@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160" role="img" aria-label="Scrying Pool">
+  <title>Scrying Pool</title>
+  <desc>A lone hooded figure standing at the centre of a circular pool, ripples spreading outward.</desc>
+  <defs>
+    <radialGradient id="spWaterDark" cx="50%" cy="34%" r="74%">
+      <stop offset="0%" stop-color="#4a93c4"/>
+      <stop offset="46%" stop-color="#1f4d7d"/>
+      <stop offset="100%" stop-color="#0a1929"/>
+    </radialGradient>
+    <radialGradient id="spGlowDark" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#d6f1ff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#d6f1ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="spHaloDark" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#7fc4e8" stop-opacity="0"/>
+      <stop offset="82%" stop-color="#7fc4e8" stop-opacity="0"/>
+      <stop offset="93%" stop-color="#7fc4e8" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#7fc4e8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <circle cx="80" cy="80" r="80" fill="url(#spHaloDark)"/>
+  <circle cx="80" cy="80" r="70" fill="url(#spWaterDark)"/>
+  <ellipse cx="80" cy="80" rx="48" ry="42" fill="url(#spGlowDark)"/>
+
+  <g fill="none" stroke="#bfe8fb" stroke-linecap="round">
+    <ellipse cx="80" cy="106" rx="52" ry="15" stroke-width="2" opacity="0.30"/>
+    <ellipse cx="80" cy="106" rx="36" ry="10.5" stroke-width="2" opacity="0.46"/>
+    <ellipse cx="80" cy="106" rx="21" ry="6" stroke-width="2" opacity="0.66"/>
+  </g>
+
+  <path d="M63 108 C63 92 67 81 72 72 C75 60 80 51 80 51 C80 51 85 60 88 72 C93 81 97 92 97 108 Z" fill="#07121e"/>
+  <ellipse cx="80" cy="72" rx="5.4" ry="7" fill="#7ab6d8" opacity="0.6"/>
+  <path d="M72 72 C75 60 80 51 80 51" fill="none" stroke="#cfeafb" stroke-width="1.6" stroke-linecap="round" opacity="0.6"/>
+
+  <path d="M14.2 56.1 A70 70 0 0 1 56.1 14.2" fill="none" stroke="#eaf7ff" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
+  <circle cx="80" cy="80" r="70" fill="none" stroke="#7fc4e8" stroke-width="3" opacity="0.8"/>
+
+  <g fill="#ffd970" opacity="0.95">
+    <g transform="translate(46,44) scale(0.62)">
+      <path d="M0 -10 C1.6 -3.6 3.6 -1.6 10 0 C3.6 1.6 1.6 3.6 0 10 C-1.6 3.6 -3.6 1.6 -10 0 C-3.6 -1.6 -1.6 -3.6 0 -10 Z"/>
+    </g>
+    <g transform="translate(115,54) scale(0.4)">
+      <path d="M0 -10 C1.6 -3.6 3.6 -1.6 10 0 C3.6 1.6 1.6 3.6 0 10 C-1.6 3.6 -3.6 1.6 -10 0 C-3.6 -1.6 -1.6 -3.6 0 -10 Z"/>
+    </g>
+    <g transform="translate(103,33) scale(0.28)">
+      <path d="M0 -10 C1.6 -3.6 3.6 -1.6 10 0 C3.6 1.6 1.6 3.6 0 10 C-1.6 3.6 -3.6 1.6 -10 0 C-3.6 -1.6 -1.6 -3.6 0 -10 Z"/>
+    </g>
+  </g>
+</svg>
