@@ -75,9 +75,16 @@ _PLAN_KEYS = (
     "direct",
     "decomposed",
 )
-_PLAN_NOISE_KEYS = frozenset(
-    {"illustration_id", "polarity", "register", "band", "colors", "k", "kind", "as_json"}
+# The routing decision, and only it. Aliases cover the shapes cts.search has
+# used for the same field.
+_ROUTE_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("literal_weight", ("literal_weight",)),
+    ("interpretive_weight", ("interpretive_weight",)),
+    ("slot_filters", ("slot_filters", "slot_filter", "slots")),
+    ("mechanical_terms", ("mechanical_terms", "mechanical_filter", "mechanical")),
 )
+# The interpretive route ("direct") and the visual-evidence route ("decomposed").
+# cts.search names its two expansion lists after the LAYER each one searches.
 _DIRECT_KEYS = ("direct", "direct_expansions", "interpretive_expansions", "interpretive")
 _DECOMPOSED_KEYS = ("decomposed", "decomposed_expansions", "literal_expansions", "literal")
 
@@ -393,27 +400,60 @@ JUDGE_INSTRUCTION = (
 
 
 def _extract_plan(params: object) -> dict | None:
+    """The routing plan out of a logged `queries.params`, whatever shape it took."""
     if not isinstance(params, dict):
         return None
     plan = params.get("plan")
     if isinstance(plan, dict) and plan:
         return plan
     if any(key in params for key in _PLAN_KEYS):
-        return {k: v for k, v in params.items() if k not in _PLAN_NOISE_KEYS}
+        return params
     return None
 
 
-def _first_list(plan: dict, keys: tuple[str, ...]) -> list:
-    for key in keys:
-        value = plan.get(key)
-        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
-            return value
+def _route_output(plan: dict) -> dict | None:
+    """The routing DECISION alone, as the training target.
+
+    `queries.params` also carries run bookkeeping — notes, timings, index sizes,
+    model names, candidate counts, which constraint was relaxed. Training a
+    router to reproduce any of that is nonsense, so the target is built from an
+    allowlist of routing fields rather than by subtracting noise keys as they
+    turn up.
+    """
+    out: dict = {}
+    for name, aliases in _ROUTE_FIELDS:
+        for alias in aliases:
+            if alias in plan:
+                out[name] = plan[alias]
+                break
+    if "literal_weight" not in out and "interpretive_weight" not in out:
+        return None
+    return out
+
+
+def _first_list(plan: dict, keys: tuple[str, ...], drop: str = "") -> list:
+    """First non-empty list of strings under any of `keys`, query echo removed.
+
+    The expansion lists include the raw query as their first entry (it is
+    searched verbatim alongside the rewrites). Keeping it would train the model
+    to echo its input back as an expansion.
+    """
+    dropped = _norm_text(drop)
+
+    def clean(value: object) -> list:
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return []
+        return [v for v in value if v.strip() and _norm_text(v) != dropped]
+
+    sources: list[dict] = [plan]
     expansions = plan.get("expansions")
     if isinstance(expansions, dict):
+        sources.append(expansions)
+    for source in sources:
         for key in keys:
-            value = expansions.get(key)
-            if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
-                return value
+            found = clean(source.get(key))
+            if found:
+                return found
     return []
 
 
@@ -421,6 +461,7 @@ def _build_judge(conn: sqlite3.Connection, props: _Props) -> tuple[list[dict], d
     records: list[dict] = []
     stats = {
         "route": 0,
+        "route_skipped_fallback": 0,
         "decompose": 0,
         "judge": 0,
         "judge_accept_raw": 0,
@@ -438,11 +479,14 @@ def _build_judge(conn: sqlite3.Connection, props: _Props) -> tuple[list[dict], d
         plan = _extract_plan(_load_json(row["params"]))
         if not text or not plan:
             continue
-        direct = _first_list(plan, _DIRECT_KEYS)
-        decomposed = _first_list(plan, _DECOMPOSED_KEYS)
-        route_plan = {
-            k: v for k, v in plan.items() if k not in {"direct", "decomposed", "expansions"}
-        }
+        direct = _first_list(plan, _DIRECT_KEYS, drop=text)
+        decomposed = _first_list(plan, _DECOMPOSED_KEYS, drop=text)
+        # router_ok False means the model call failed and cts.search substituted
+        # its neutral 0.5/0.5 no-filter default. Exporting those would teach the
+        # router to answer 0.5/0.5 to everything — a fallback is not a label.
+        route_plan = None if plan.get("router_ok") is False else _route_output(plan)
+        if plan.get("router_ok") is False:
+            stats["route_skipped_fallback"] += 1
         if route_plan:
             records.append(
                 {
@@ -671,6 +715,12 @@ def _print_report(report: dict) -> None:
         f"(human rows x{HUMAN_WEIGHT}); split by query text, "
         f"{report['val'] / total * 100:.1f}% val"
     )
+    if not report["val"]:
+        print(
+            f"  note: the val file is empty — the split is a hash of the query TEXT, and "
+            f"{VAL_FRACTION:.0%} of too few distinct themes rounds to none. It fills in as "
+            "the corpus grows; holding out by artwork instead would be worse than useless."
+        )
 
     if target == "embed":
         print(
@@ -701,7 +751,7 @@ def _print_report(report: dict) -> None:
         ratio = accept / judged if judged else 0.0
         print(
             f"  tasks: route {stats['route']} | decompose {stats['decompose']} | "
-            f"judge {stats['judge']}"
+            f"judge {stats['judge']} | {stats['human_records']} human-weighted"
         )
         print(
             f"  judge accept/reject: {accept}/{reject} = {ratio:.2f} accept "
@@ -723,6 +773,12 @@ def _print_report(report: dict) -> None:
                     "  WARNING: fewer than three registers represented. The adapter will "
                     "overfit to one and get worse than the base model at the others."
                 )
+        if stats["route_skipped_fallback"]:
+            print(
+                f"  note: {stats['route_skipped_fallback']} logged plans were router "
+                "fallbacks (router_ok false) and were skipped — a 0.5/0.5 default is not "
+                "a routing label."
+            )
         if not stats["route"] and not stats["decompose"]:
             print(
                 "  note: no routing plans logged yet, so this export is judge-only. Run "

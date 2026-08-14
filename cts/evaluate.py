@@ -278,10 +278,20 @@ def run(cfg: Config, collect_prefs: bool = False) -> dict:
     prompt_version = _prompt_version(conn)
     index_started = time.monotonic()
     index = _load_index(cfg, conn)
-    index_build_seconds = round(time.monotonic() - index_started, 3)
+    # cts.index times its own build and exposes it for exactly this purpose; use
+    # that number so the eval report and the plan logged by search.execute pin
+    # the same value. Wall clock here is the fallback.
+    index_build_seconds = round(
+        float(getattr(index, "build_seconds", None) or (time.monotonic() - index_started)), 3
+    )
     index_size = {
         "props": int(len(getattr(index, "prop_ids", []) or [])),
-        "artworks": int(len(set(getattr(index, "illustration_ids", []) or []))),
+        "artworks": int(
+            getattr(index, "artwork_count", None)
+            or len(set(getattr(index, "illustration_ids", []) or []))
+        ),
+        "dim": int(getattr(index, "dim", 0) or 0),
+        "missing_embeddings": int(getattr(index, "missing_embeddings", 0) or 0),
     }
 
     header = {
@@ -422,13 +432,13 @@ def _score_literal(
     print(
         f"    recall pool {entry['recall_pool']:.2f} ({len(hits_pool)}/{len(gold)})"
         f"   top5 {entry['recall_at_5']:.2f} ({len(hits_top5)}/{len(gold)})"
-        f"   [{elapsed_str(entry)}]"
+        f"   [{_elapsed_str(entry)}]"
     )
     for i, r in enumerate(results[:5], start=1):
         _print_result_line(i, r, 1.0 if _matches(str(r.get("name") or ""), gold_keys) else 0.0)
 
 
-def elapsed_str(entry: dict) -> str:
+def _elapsed_str(entry: dict) -> str:
     return f"{entry.get('latency_s', 0.0):.1f}s"
 
 
@@ -477,7 +487,7 @@ def _score_marked(
     shown = f"{entry['p_at_5']:.2f}" if entry["p_at_5"] is not None else "--"
     print(
         f"    {label} {shown}  ({len(accepted)} accepted of {len(marked)} marked, "
-        f"{entry['n_pending']} pending)   [{elapsed_str(entry)}]"
+        f"{entry['n_pending']} pending)   [{_elapsed_str(entry)}]"
     )
 
 
@@ -591,9 +601,11 @@ def _print_header(header: dict) -> None:
         f"  prompt_version {header['prompt_version']} | vision {models['vision']} | "
         f"embed {models['embed']} | judge {models['judge']}"
     )
+    size = header["index_size"]
+    missing = f", {size['missing_embeddings']} props unembedded" if size["missing_embeddings"] else ""
     print(
         f"  index build {header['index_build_seconds']}s "
-        f"({header['index_size']['props']} props / {header['index_size']['artworks']} artworks)"
+        f"({size['props']} props / {size['artworks']} artworks, dim {size['dim']}{missing})"
         f" | {header['n_queries']} queries"
         f" | {'interactive' if header['interactive'] else 'non-interactive'}"
     )
@@ -674,12 +686,12 @@ def _print_summary(report: dict) -> None:
         f"{'verified' if lit['gold_verified'] else 'UNVERIFIED gold'})"
     )
     print(
-        f"  abstract P@5       {num(absx['p_at_5'])}   ({absx['accepted']}/{absx['marked']} "
-        f"marked, {absx['pending']} pending)"
+        f"  abstract P@5       {num(absx['p_at_5'])}   ({absx['accepted']} accepted of "
+        f"{absx['marked']} marked, {absx['pending']} pending)"
     )
     print(
-        f"  adversarial        {num(adv['p_at_5'])} accepted   ({adv['accepted']}/{adv['marked']} "
-        f"marked, {adv['pending']} pending) — expected to be low"
+        f"  adversarial        {num(adv['p_at_5'])} accept rate   ({adv['accepted']} accepted "
+        f"of {adv['marked']} marked, {adv['pending']} pending) — expected to be low"
     )
     print(
         f"  pairwise agreement {num(pair['agreement'])}   ({pair['agree']}/{pair['comparable']} "

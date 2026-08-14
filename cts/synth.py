@@ -282,6 +282,7 @@ def run(cfg: Config, limit: int | None = None) -> dict:
         "near_misses": 0,
         "failed": 0,
         "missing_literal_register": 0,
+        "missing_abstract_register": 0,
         "missing_analogical_register": 0,
     }
 
@@ -328,11 +329,15 @@ def run(cfg: Config, limit: int | None = None) -> dict:
             stats["failed"] += 1
             continue
 
+        # The spread is the point: one register per artwork trains an adapter that
+        # is worse than the base model at the other two.
         registers = {p["register"] for p in positives}
         if "literal" not in registers:
             stats["missing_literal_register"] += 1
         if "analogical" not in registers:
             stats["missing_analogical_register"] += 1
+        if not registers & ABSTRACT_REGISTERS:
+            stats["missing_abstract_register"] += 1
 
         stats["positives"] += _store(conn, cfg, iid, positives, "positive")
         stats["near_misses"] += _store(conn, cfg, iid, near_misses, "near_miss")
@@ -353,8 +358,11 @@ def run(cfg: Config, limit: int | None = None) -> dict:
     )
     if stats["artworks"]:
         print(
-            f"synth: spectrum — {stats['missing_literal_register']} artworks produced no "
-            f"literal theme, {stats['missing_analogical_register']} produced no analogical "
-            "theme (both should stay near zero; if they climb, tighten SYNTH_PROMPT)"
+            f"synth: spectrum — artworks with no literal theme: "
+            f"{stats['missing_literal_register']}, no abstract theme: "
+            f"{stats['missing_abstract_register']}, no analogical theme: "
+            f"{stats['missing_analogical_register']} "
+            f"(of {stats['artworks']}; all three should stay near zero — if they climb, "
+            "tighten SYNTH_PROMPT rather than accepting a one-register dataset)"
         )
     return stats
