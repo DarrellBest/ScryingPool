@@ -121,7 +121,7 @@ def load_evidence(conn: sqlite3.Connection, illustration_ids: list[str]) -> dict
     evidence: dict[str, dict] = {
         ill: {"literal": "", "interpretive": "", "props": []} for ill in illustration_ids
     }
-    for chunk in _chunks(illustration_ids, 400):
+    for chunk in chunks(illustration_ids, 400):
         marks = ",".join("?" * len(chunk))
         for row in conn.execute(
             f"SELECT illustration_id, literal, interpretive FROM descriptions "
@@ -142,7 +142,7 @@ def load_evidence(conn: sqlite3.Connection, illustration_ids: list[str]) -> dict
     return evidence
 
 
-def _chunks(items: list, size: int):
+def chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
 
@@ -288,7 +288,7 @@ def judge_batches(
         return []
     evidence = load_evidence(conn, [c["illustration_id"] for c in candidates])
     judged: list[dict] = []
-    for batch in _chunks(candidates, batch_size):
+    for batch in chunks(candidates, batch_size):
         judged.extend(judge_batch(cfg, query, batch, evidence))
     invented = sum(int(r.get("invented_prop_ids") or 0) for r in judged)
     if invented:
@@ -344,7 +344,7 @@ def verify_finalists(
     reports that rather than pretending they were checked.
     """
     prompt = build_verify_prompt(query)
-    ordered = sorted(judged, key=_fit_key, reverse=True)[:top_n]
+    ordered = sorted(judged, key=fit_key, reverse=True)[:top_n]
     available = True
 
     for cand in ordered:
@@ -387,7 +387,7 @@ def verify_finalists(
     return judged, available
 
 
-def _fit_key(result: dict) -> float:
+def fit_key(result: dict) -> float:
     """Sort key that puts null fits (unjudged) below everything scored."""
     fit = result.get("fit")
     return -1.0 if fit is None else float(fit)

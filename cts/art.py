@@ -13,7 +13,6 @@ happily skip.
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 from pathlib import Path
 
@@ -60,8 +59,6 @@ def _download(url: str, dest: Path) -> None:
 
 def run(cfg: Config) -> dict:
     """Phase 4. Idempotent: an art crop already on disk is never re-fetched."""
-    import time
-
     conn = db.connect(cfg)
     try:
         art_dir = Path(cfg.art_dir)

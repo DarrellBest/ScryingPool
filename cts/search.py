@@ -110,7 +110,12 @@ held_objects, other_figures and palette are lists: use contains.
 Only add a filter when the query states a requirement that is certain to be recorded in
 that slot, and prefer no filter at all over a shaky one — the retriever already searches
 the full text of every literal statement, while a wrong filter deletes correct answers
-outright. An absent attribute is written "none", so not_contains works for absence.
+outright.
+A slot has three possible states, not two: the attribute itself ("full grey beard"),
+the literal string "none" when it is genuinely absent, and "obscured (...)" when the
+image hides it. So "must have X" is `contains X`, and "must not have X" is
+`not_contains X` — which keeps "none" and "obscured" rows, correctly, since an obscured
+attribute is unknown rather than known-absent.
 
 mechanical_terms — zero or more gameplay terms (oracle-text keywords, card types, EDHREC
 deck archetypes such as "lifegain", "sacrifice", "landfall", "voltron") but ONLY when the
@@ -342,9 +347,10 @@ def _slot_clause(flt: dict) -> tuple[str, list]:
     if op == "contains":
         return f"lower(CAST({field} AS TEXT)) LIKE '%' || lower(?) || '%'", [path, value]
     if op == "not_contains":
+        # `field` appears twice, so `path` must be bound twice.
         return (
             f"({field} IS NULL OR lower(CAST({field} AS TEXT)) NOT LIKE '%' || lower(?) || '%')",
-            [path, value],
+            [path, path, value],
         )
     if op == "gte":
         return f"CAST({field} AS REAL) >= CAST(? AS REAL)", [path, value]
@@ -410,6 +416,7 @@ def retrieve(
     fused: dict[str, float] = {}
     per_method: dict[str, dict[str, float]] = {"dense": {}, "bm25": {}}
     best_layer: dict[tuple[str, str], str] = {}
+    best_rank: dict[tuple[str, str], int] = {}
 
     if not len(index):
         return fused, per_method, best_layer
@@ -461,7 +468,12 @@ def retrieve(
                 contribution = weights.get(layer, 0.0) / (RRF_K + rank)
                 fused[ill] = fused.get(ill, 0.0) + contribution
                 per_method[method][ill] = per_method[method].get(ill, 0.0) + contribution
-                best_layer.setdefault((method, ill), layer)
+                # Log the layer of the single best-ranked proposition this method found
+                # for this artwork, across every expansion — not whichever ran first.
+                key = (method, ill)
+                if rank < best_rank.get(key, 1 << 30):
+                    best_rank[key] = rank
+                    best_layer[key] = layer
 
     return fused, per_method, best_layer
 
@@ -485,7 +497,7 @@ def candidate_rows(conn: sqlite3.Connection, illustration_ids: list[str]) -> dic
         LEFT JOIN edhrec e ON e.oracle_id = a.oracle_id
         WHERE a.illustration_id IN ({marks})
     """
-    for chunk in judge_mod._chunks(illustration_ids, 400):
+    for chunk in judge_mod.chunks(illustration_ids, 400):
         marks = ",".join("?" * len(chunk))
         for row in conn.execute(sql.format(marks=marks), chunk):
             out[row["illustration_id"]] = dict(row)
@@ -657,7 +669,7 @@ def _result_dict(cand: dict, terms: list[str]) -> dict:
 
 def select(index: SearchIndex, judged: list[dict], k: int) -> list[dict]:
     """Diversity over the passing results, then stretches to fill, clearly separated."""
-    ordered = sorted(judged, key=judge_mod._fit_key, reverse=True)
+    ordered = sorted(judged, key=judge_mod.fit_key, reverse=True)
     survivors = [r for r in ordered if _passes(r)]
     chosen = judge_mod.diversify(index, survivors, k)
 
@@ -828,7 +840,7 @@ def execute(
         results = [_result_dict(c, terms) for c in chosen]
         pool = [
             _result_dict(c, terms)
-            for c in sorted(judged, key=judge_mod._fit_key, reverse=True)
+            for c in sorted(judged, key=judge_mod.fit_key, reverse=True)
         ]
 
         plan["counts"]["judged"] = len(judged)

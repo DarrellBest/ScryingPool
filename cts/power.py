@@ -20,6 +20,17 @@ Components, all in [0, 1]:
           + w.cmc        * cmc_norm
           + w.cedh       * cedh
 
+A caveat on `cedh`, worth knowing before tuning its weight. SPEC.md and
+config.toml both describe the cEDH flag as "rare but highly informative". It is
+not rare: EDHREC tags a handful of cEDH decks for very nearly every commander
+that has a page at all (Atraxa 57, Krenko 103, Kroxa 20, Beluna 1), so a literal
+presence flag is 1 for almost the whole corpus and mostly re-states deck count.
+The flag is still computed literally, because redefining it silently would be
+worse — but `cedh_share` and `bracket5_share` (bracket 5 is the official cEDH
+bracket) go into the components next to it, so switching the scored term to a
+continuous signal is a one-line change here and needs no re-fetch.
+`power.run` prints what fraction of the corpus the flag fired on.
+
 No banding here. SPEC.md wants five quantile bands computed at query time over
 the whole distribution, so nothing about a band is written to disk.
 
@@ -93,17 +104,46 @@ def _cedh_decks(themes_json: str | None) -> int:
     return 0
 
 
+def _bracket5(brackets_json: str | None) -> int:
+    """Decks in Commander bracket 5, which is cEDH by definition.
+
+    Pulled out of `edhrec.raw` at `$.bracket_counts` by SQLite rather than
+    loading the ~120KB blob per row into Python.
+    """
+    if not brackets_json:
+        return 0
+    try:
+        brackets = json.loads(brackets_json)
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(brackets, dict):
+        return 0
+    count = brackets.get("5")
+    return int(count) if isinstance(count, (int, float)) else 0
+
+
 _SELECT = """
 SELECT c.oracle_id AS oracle_id,
        c.name      AS name,
        c.cmc       AS cmc,
        e.num_decks AS num_decks,
        e.avg_price AS avg_price,
-       e.themes    AS themes
+       e.themes    AS themes,
+       {brackets}  AS brackets
 FROM cards c
 LEFT JOIN edhrec e ON e.oracle_id = c.oracle_id
 ORDER BY c.oracle_id
 """
+
+
+def _fetch_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Rows for scoring, with bracket_counts if this SQLite has JSON1."""
+    try:
+        return conn.execute(
+            _SELECT.format(brackets="json_extract(e.raw, '$.bracket_counts')")
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return conn.execute(_SELECT.format(brackets="NULL")).fetchall()
 
 _UPSERT = """
 INSERT INTO power (oracle_id, score, components)
@@ -117,7 +157,7 @@ def run(cfg: Config) -> dict:
     """Phase 3. Always recomputes every row."""
     conn = db.connect(cfg)
     try:
-        rows = conn.execute(_SELECT).fetchall()
+        rows = _fetch_rows(conn)
         n = len(rows)
         if not n:
             print("power: no cards to score", flush=True)
@@ -143,6 +183,8 @@ def run(cfg: Config) -> dict:
             dtype=np.float64,
         )
         cedh_decks = np.array([_cedh_decks(r["themes"]) for r in rows], dtype=np.int64)
+        bracket5 = np.array([_bracket5(r["brackets"]) for r in rows], dtype=np.int64)
+        denom = np.where(decks > 0, decks, 1.0)
 
         log_decks_norm = _minmax(np.log1p(decks))
         price_pct = _percentile(prices, has_price)
@@ -168,7 +210,12 @@ def run(cfg: Config) -> dict:
                 "num_decks": int(decks[i]),
                 "avg_price": float(prices[i]) if has_price[i] else None,
                 "cmc": float(cmcs[i]),
+                # unscored, but kept so the cEDH term can be made continuous
+                # without re-fetching anything. See the module docstring.
                 "cedh_decks": int(cedh_decks[i]),
+                "cedh_share": round(float(cedh_decks[i] / denom[i]), 6),
+                "bracket5_decks": int(bracket5[i]),
+                "bracket5_share": round(float(bracket5[i] / denom[i]), 6),
                 "weights": {
                     "deck_count": w_decks,
                     "price": w_price,
@@ -184,12 +231,20 @@ def run(cfg: Config) -> dict:
             print(f"  scored {min(start + _BATCH, len(payload)):,}/{n:,}", flush=True)
 
         with_edhrec = int(np.count_nonzero(decks > 0))
+        flagged = int(cedh.sum())
         print(
             f"power: scored {n:,} commanders "
-            f"({with_edhrec:,} with EDHREC decks, {int(cedh.sum()):,} cEDH-tagged, "
+            f"({with_edhrec:,} with EDHREC decks, {flagged:,} cEDH-tagged, "
             f"{int(has_price.sum()):,} priced)",
             flush=True,
         )
+        if n and flagged / n > 0.8:
+            print(
+                f"power: note - the cEDH flag fired on {100 * flagged / n:.0f}% of the "
+                f"corpus, so it barely separates anything; components carry "
+                f"cedh_share and bracket5_share if you want a continuous term",
+                flush=True,
+            )
         print(
             f"power: score min {score.min():.4f} / median {float(np.median(score)):.4f} "
             f"/ max {score.max():.4f} (bands are quantiles at query time)",
