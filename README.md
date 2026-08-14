@@ -17,6 +17,7 @@
   <img alt="Models: Ollama" src="https://img.shields.io/badge/models-Ollama-1d3b63?style=flat-square&logo=ollama&logoColor=white">
   <img alt="Runs 100% local" src="https://img.shields.io/badge/runs-100%25%20local-2e7d5b?style=flat-square">
   <img alt="Vector DB: none" src="https://img.shields.io/badge/vector%20DB-none-2e7d5b?style=flat-square">
+  <img alt="License: PolyForm Noncommercial" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-1d3b63?style=flat-square">
 </p>
 
 <p>
@@ -611,8 +612,9 @@ the artist and set alongside a result, and links back to the exact printing that
 approved or endorsed by Wizards. Portions of the materials used are property of Wizards of the Coast.
 © Wizards of the Coast LLC.
 
-**Licence** — this repository does not currently include a `LICENSE` file, so no licence is granted by default.
-If you would like to use the code, open an issue and ask.
+**Licence** — the code is licensed under [PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal use and
+any other noncommercial purpose. Commercial use requires a separate paid licence, so open an issue to arrange
+one. Every copy must carry the copyright notice at the top of `LICENSE.md`.
 
 <div align="center">
 <br>
