@@ -108,7 +108,7 @@ Available paths: {paths}
 Ops: equals, contains, not_contains, gte, lte (gte/lte only on figure_count).
 held_objects, other_figures and palette are lists: use contains, which matches inside
 their compact JSON. held_objects serializes as
-  [{"object":"lantern","is_weapon":false}]
+  [{{"object":"lantern","is_weapon":false}}]
 so "holding something that isn't a weapon" is contains with value "is_weapon":false,
 and "holding a weapon" is contains with value "is_weapon":true.
 Only add a filter when the query states a requirement that is certain to be recorded in
@@ -617,23 +617,27 @@ def _log_retrievals(conn: sqlite3.Connection, query_id: int, rows: list[tuple]) 
     conn.commit()
 
 
-def _fused_rows(pool: list[dict]) -> list[tuple]:
+def _fused_rows(query_id: int, pool: list[dict]) -> list[tuple]:
     """The pool the judge actually sees: rank, RRF score, method 'rrf', layer 'fused'."""
     return [
-        (None, c["illustration_id"], rank, float(c.get("score") or 0.0), "rrf", "fused")
+        (query_id, c["illustration_id"], rank, float(c.get("score") or 0.0), "rrf", "fused")
         for rank, c in enumerate(pool, start=1)
     ]
 
 
 def _method_rows(
-    per_method: dict[str, dict[str, float]], best_layer: dict[tuple[str, str], str]
+    query_id: int,
+    per_method: dict[str, dict[str, float]],
+    best_layer: dict[tuple[str, str], str],
 ) -> list[tuple]:
     """Per-method top-50, carrying the layer of the proposition that contributed."""
     rows: list[tuple] = []
     for method, scores in per_method.items():
         ordered = sorted(scores.items(), key=lambda kv: -kv[1])[:PER_METHOD_LOG]
         for rank, (ill, score) in enumerate(ordered, start=1):
-            rows.append((None, ill, rank, float(score), method, best_layer.get((method, ill), "")))
+            rows.append(
+                (query_id, ill, rank, float(score), method, best_layer.get((method, ill), ""))
+            )
     return rows
 
 
@@ -797,8 +801,8 @@ def execute(
         _log_retrievals(
             conn,
             query_id,
-            [(query_id, *row[1:]) for row in _fused_rows(candidates)]
-            + [(query_id, *row[1:]) for row in _method_rows(per_method, best_layer)],
+            _fused_rows(query_id, candidates)
+            + _method_rows(query_id, per_method, best_layer),
         )
 
         judged = judge_mod.judge_batches(cfg, conn, query, candidates)
@@ -825,7 +829,7 @@ def execute(
                     relaxed = f"power band widened from {band} to {low}-{high}"
                     print(f"search: {relaxed} ({len(fresh)} more candidates)", file=sys.stderr)
                     _log_retrievals(
-                        conn, query_id, [(query_id, *row[1:]) for row in _fused_rows(fresh)]
+                        conn, query_id, _fused_rows(query_id, fresh)
                     )
                     extra = judge_mod.judge_batches(cfg, conn, query, fresh)
                     judge_mod.log_judgments(conn, query_id, cfg.judge_model, extra)
