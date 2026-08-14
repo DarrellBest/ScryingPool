@@ -617,11 +617,15 @@ def _log_retrievals(conn: sqlite3.Connection, query_id: int, rows: list[tuple]) 
     conn.commit()
 
 
-def _fused_rows(query_id: int, pool: list[dict]) -> list[tuple]:
-    """The pool the judge actually sees: rank, RRF score, method 'rrf', layer 'fused'."""
+def _fused_rows(query_id: int, pool: list[dict], start: int = 1) -> list[tuple]:
+    """The pool the judge actually sees: rank, RRF score, method 'rrf', layer 'fused'.
+
+    `start` continues the rank space for candidates admitted by a later widening,
+    so one query never logs two rows at rank 1 and MIN(rank) stays meaningful.
+    """
     return [
         (query_id, c["illustration_id"], rank, float(c.get("score") or 0.0), "rrf", "fused")
-        for rank, c in enumerate(pool, start=1)
+        for rank, c in enumerate(pool, start=start)
     ]
 
 
@@ -749,6 +753,12 @@ def execute(
                 "colors": colors,
                 "k": k,
                 "kind": kind,
+                # Seeded here, before any early return, so every logged plan carries
+                # the key in the same shape. expand() overwrites it when it runs; a
+                # run that never reaches expansion (empty index) logs empty lists
+                # rather than omitting the field, which is what Phase 12's
+                # decompose export reads.
+                "expansions": {"literal": [], "interpretive": []},
                 "models": {
                     "judge": cfg.judge_model,
                     "embed": cfg.embed_model,
@@ -829,7 +839,11 @@ def execute(
                     relaxed = f"power band widened from {band} to {low}-{high}"
                     print(f"search: {relaxed} ({len(fresh)} more candidates)", file=sys.stderr)
                     _log_retrievals(
-                        conn, query_id, _fused_rows(query_id, fresh)
+                        conn,
+                        query_id,
+                        # Ranked after the original pool: these only became
+                        # candidates once the band was widened.
+                        _fused_rows(query_id, fresh, start=len(candidates) + 1),
                     )
                     extra = judge_mod.judge_batches(cfg, conn, query, fresh)
                     judge_mod.log_judgments(conn, query_id, cfg.judge_model, extra)

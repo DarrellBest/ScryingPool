@@ -12,3 +12,11 @@ __pycache__/
 # Training exports land at the repo root by default (Phase 12).
 # Root-anchored so eval/queries.jsonl stays committed.
 /*.jsonl
+
+# Phase 12 training exports: `export-training --out` defaults to exports/,
+# holding <target>_train.jsonl and <target>_val.jsonl.
+exports/
+
+# Phase 11 eval run artifacts (one timestamped JSON per run).
+# eval/queries.jsonl is the committed dataset and stays tracked.
+eval/results/

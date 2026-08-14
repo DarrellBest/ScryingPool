@@ -106,6 +106,27 @@ def _matches(name: str, gold_keys: set[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _fused_clause(conn: sqlite3.Connection, query_id: int | None, alias: str = "") -> str:
+    """`AND method = 'rrf'`, when this query logged a fused pool at all.
+
+    cts.search writes THREE rank spaces into `retrievals` for one query: the
+    fused pool the judge actually saw (method 'rrf', post-filter, top 100) and
+    each method's own top 50 ('dense', 'bm25'). The per-method rows rank in a
+    different space and include artworks the post-filters removed, so folding
+    them in with MIN(rank) overstates recall and can push genuine pool members
+    past the LIMIT. The pool this module means is the fused one, per SPEC.md
+    Phase 7 step 6. A run that logged no 'rrf' rows (a stub, or a search that
+    returned nothing) falls back to every row rather than to an empty pool.
+    """
+    if query_id is None:
+        return ""
+    row = conn.execute(
+        "SELECT 1 FROM retrievals WHERE query_id = ? AND method = 'rrf' LIMIT 1",
+        (query_id,),
+    ).fetchone()
+    return f"AND {alias}method = 'rrf'" if row else ""
+
+
 def _pool_names(conn: sqlite3.Connection, query_id: int | None, limit: int = POOL_SIZE) -> list[str]:
     """Commander names in the retrieval pool for this query, best rank first.
 
@@ -117,12 +138,12 @@ def _pool_names(conn: sqlite3.Connection, query_id: int | None, limit: int = POO
     if query_id is None:
         return []
     rows = conn.execute(
-        """
+        f"""
         SELECT c.name AS name, MIN(r.rank) AS best
           FROM retrievals r
           JOIN arts  a ON a.illustration_id = r.illustration_id
           JOIN cards c ON c.oracle_id = a.oracle_id
-         WHERE r.query_id = ?
+         WHERE r.query_id = ? {_fused_clause(conn, query_id, "r.")}
          GROUP BY c.oracle_id
          ORDER BY best ASC
          LIMIT ?
@@ -137,10 +158,10 @@ def _pool_rank_map(conn: sqlite3.Connection, query_id: int | None) -> dict[str, 
     if query_id is None:
         return {}
     rows = conn.execute(
-        """
+        f"""
         SELECT illustration_id, MIN(rank) AS best
           FROM retrievals
-         WHERE query_id = ?
+         WHERE query_id = ? {_fused_clause(conn, query_id)}
          GROUP BY illustration_id
          ORDER BY best ASC
         """,

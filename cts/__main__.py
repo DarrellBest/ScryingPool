@@ -190,7 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["embed", "judge"],
         help="which dataset to write: embed (contrastive triples) or judge (fit labels)",
     )
-    p.add_argument("--out", default=None, metavar="PATH", help="output file (default: chosen by target)")
+    p.add_argument(
+        "--out",
+        default=None,
+        metavar="DIR",
+        help="output directory, receiving <target>_train.jsonl and <target>_val.jsonl "
+        "(default: exports/)",
+    )
     p.set_defaults(handler=_export_training)
 
     return parser

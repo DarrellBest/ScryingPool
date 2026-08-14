@@ -51,5 +51,12 @@ price = 0.25
 # Average mana value of the commander itself. Cheap commanders do more, sooner.
 cmc = 0.2
 
-# cEDH presence flag, when EDHREC exposes one. Rare but highly informative.
+# cEDH presence flag, when EDHREC exposes one.
+# Not rare: live EDHREC data tags at least one cEDH deck for very nearly every
+# commander that has a page at all, so this flag reads 1 for most of the corpus
+# and mostly restates deck count. power.py warns when it fires on more than 80%
+# of the corpus, and stores `cedh_share` and `bracket5_share` (bracket 5 is the
+# official cEDH bracket) alongside it in power.components — switching the scored
+# term to one of those continuous signals is a one-line change in power.py's
+# `score = ...` sum and needs no re-fetch.
 cedh = 0.15
