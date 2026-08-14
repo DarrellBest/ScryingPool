@@ -1,2 +1,620 @@
-# ScryingPool
-A tool designed to pick pod commanders in mtg play scrying over card images for themes
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img alt="Scrying Pool" src="assets/logo-light.svg" width="132" height="132">
+</picture>
+
+<h1>Scrying Pool</h1>
+
+<p><b>Search Magic: The Gathering commanders by what their card art depicts, means, or evokes.</b></p>
+
+<p><i>&ldquo;commanders with beards&rdquo; &nbsp;·&nbsp; &ldquo;a single figure against a huge empty background&rdquo; &nbsp;·&nbsp; &ldquo;commanders that look lonely&rdquo; &nbsp;·&nbsp; &ldquo;would fit on a black metal album cover&rdquo;</i></p>
+
+<p>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-1d3b63?style=flat-square&logo=python&logoColor=white">
+  <img alt="Storage: SQLite" src="https://img.shields.io/badge/storage-SQLite-1d3b63?style=flat-square&logo=sqlite&logoColor=white">
+  <img alt="Models: Ollama" src="https://img.shields.io/badge/models-Ollama-1d3b63?style=flat-square&logo=ollama&logoColor=white">
+  <img alt="Runs 100% local" src="https://img.shields.io/badge/runs-100%25%20local-2e7d5b?style=flat-square">
+  <img alt="Vector DB: none" src="https://img.shields.io/badge/vector%20DB-none-2e7d5b?style=flat-square">
+</p>
+
+<p>
+  <a href="#the-theme-spectrum">Spectrum</a> &nbsp;·&nbsp;
+  <a href="#an-example-search">Example</a> &nbsp;·&nbsp;
+  <a href="#how-it-works">How it works</a> &nbsp;·&nbsp;
+  <a href="#quickstart">Quickstart</a> &nbsp;·&nbsp;
+  <a href="#command-reference">Commands</a> &nbsp;·&nbsp;
+  <a href="#evaluation">Evaluation</a> &nbsp;·&nbsp;
+  <a href="#known-limits">Limits</a>
+</p>
+
+🔮 &nbsp;Ollama + SQLite + numpy on your own machine. No cloud, no vector database, no framework.
+
+</div>
+
+---
+
+> An artwork described as *"a hooded figure stands alone on a cliff at dusk, muted blues, no other figures"*
+> contains every scrap of evidence for **lonely** and never once contains a word that embeds near it.
+
+That sentence is the whole design. A single literal description layer cannot serve both ends of the theme
+spectrum, so Scrying Pool gives every artwork **two descriptions with opposite epistemic rules**, and sends
+every abstract query down **two independent retrieval routes**. Gameplay identity and artwork are modelled
+separately, so a theme matches a specific *printing* — Atraxa has half a dozen wildly different arts, and only
+one of them might be lonely.
+
+---
+
+## The theme spectrum
+
+| Register | Ask it | How it finds them |
+| :-- | :-- | :-- |
+| **Literal** | `commanders with a full beard` | Routes ≈ 1.0 literal. A structured filter on the `primary_subject.facial_hair` slot, plus the literal propositions. The bearded villager standing behind the dragon is an *other figure*, so he never makes the dragon bearded. |
+| **Literal, negated** | `commanders holding something that isn't a weapon` | Every held object is recorded with an `is_weapon` flag, so this becomes `held_objects contains "is_weapon":false` — a lantern, a book, an infant, a severed head. |
+| **Compositional** | `a single small figure against a huge empty background` | ≈ 0.7 / 0.3. Reaches the `composition` and `figure_count` slots and the literal statements that record negative space. |
+| **Stylistic** | `looks like a woodcut or an engraving` | The `art_style` slot is filled with medium, technique and finish — *"woodcut-like hard black shapes"* — not with the word *fantasy*. |
+| **Affective** | `commanders that look lonely` | ≈ 0.3 / 0.7, and **both routes at once**: interpretive propositions that say *conveys isolation*, and a decomposition into *single figure with their back turned*, *vast empty landscape*, *cold desaturated palette* searched against the literal layer. |
+| **Narrative** | `art that feels like the moment right before a betrayal` | ≈ 0.25 / 0.75. The interpretive layer is asked explicitly for implied narrative and the power dynamic between figures. |
+| **Analogical** | `would fit on a black metal album cover` | ≈ 0.2 / 0.8. Every artwork is asked for at least two analogies to film, music or period art — and when none of them anticipated *this* analogy, the decomposed route still finds the monochrome, the frost and the silhouettes. |
+
+<sub>The weight pairs above are the router's own calibration table, verbatim from <code>cts/search.py</code>. The
+router returns a blend, never a branch: <i>"menacing dragons with beards"</i> is genuinely both and is not forced
+to pick.</sub>
+
+---
+
+## An example search
+
+> [!NOTE]
+> **Illustrative sample output.** The layout, labels and link block below reproduce exactly what `cts/search.py`
+> prints — but the commanders, printings, fit scores, credits and URLs are a mock-up for this README, not a
+> recorded run.
+
+```console
+$ python -m cts search "commanders that look lonely" --band 3
+
+Scrying Pool · "commanders that look lonely"
+route: 30% literal / 70% interpretive · band 3
+note: power band widened from 3 to 2-4 — fewer than 5 results passed at the requested band
+
+1. Karn, Silver Golem  {5}  [C]  band 3  fit 0.86  verified
+   art: USG · Mark Tedin · 1 of 3 arts
+   A single metal figure stands motionless in an empty hall, lit only from behind.
+      edhrec     https://edhrec.com/commanders/karn-silver-golem
+      theme      https://edhrec.com/commanders/karn-silver-golem/artifacts
+      scryfall   https://scryfall.com/card/usg/308/karn-silver-golem
+      tcgplayer  https://www.tcgplayer.com/product/5089
+      art crop   https://cards.scryfall.io/art_crop/front/6/8/68d4ca6d.jpg
+
+2. Kokusho, the Evening Star  {3}{B}{B}  [B]  band 4  fit 0.79  verified
+   art: CHK · Kev Walker
+   One dragon alone against an empty night sky, no other figure anywhere in frame.
+      edhrec     https://edhrec.com/commanders/kokusho-the-evening-star
+      theme      https://edhrec.com/commanders/kokusho-the-evening-star/dragons
+      scryfall   https://scryfall.com/card/chk/114/kokusho-the-evening-star
+      tcgplayer  https://www.tcgplayer.com/product/10938
+      art crop   https://cards.scryfall.io/art_crop/front/a/1/a1f7c2be.jpg
+
+3. Thassa, God of the Sea  {2}{U}  [U]  band 3  fit 0.71  verified
+   art: THS · Jason Chan
+   A solitary figure rises from open water at dusk, cold blues, nothing else present.
+      edhrec     https://edhrec.com/commanders/thassa-god-of-the-sea
+      theme      https://edhrec.com/commanders/thassa-god-of-the-sea/devotion
+      scryfall   https://scryfall.com/card/ths/49/thassa-god-of-the-sea
+      tcgplayer  https://www.tcgplayer.com/product/68216
+      art crop   https://cards.scryfall.io/art_crop/front/3/c/3c0be2d9.jpg
+
+4. Avacyn, Angel of Hope  {5}{W}{W}{W}  [W]  band 2  fit 0.58  verified
+   art: AVR · Jason Chan · 1 of 2 arts
+   One winged figure suspended in a vast pale sky, the ground far below and empty.
+      edhrec     https://edhrec.com/commanders/avacyn-angel-of-hope
+      theme      https://edhrec.com/commanders/avacyn-angel-of-hope/angels
+      scryfall   https://scryfall.com/card/avr/6/avacyn-angel-of-hope
+      tcgplayer  https://www.tcgplayer.com/product/57330
+      art crop   https://cards.scryfall.io/art_crop/front/7/2/72ab5e14.jpg
+
+5. Purphoros, God of the Forge  {3}{R}  [R]  band 3  fit 0.44  STRETCH (below the 0.5 bar)
+   art: THS · Eric Deschamps
+   A lone smith at a forge, but the composition is crowded and the mood is industry.
+      edhrec     https://edhrec.com/commanders/purphoros-god-of-the-forge
+      theme      https://edhrec.com/commanders/purphoros-god-of-the-forge/tokens
+      scryfall   https://scryfall.com/card/ths/135/purphoros-god-of-the-forge
+      tcgplayer  https://www.tcgplayer.com/product/68191
+      art crop   https://cards.scryfall.io/art_crop/front/d/4/d419a7f0.jpg
+
+4 of 5 results clear the 0.5 fit bar; the rest are stretches.
+```
+
+Three things in that block are deliberate. Relaxed constraints are **reported, never silent** — if fewer than `k`
+results clear the bar, the power band widens one step and says so. Weak matches are **labelled stretches** instead
+of being passed off as hits. And because the query is abstract, the **fit score is printed**, so a strong read and
+a stretch are visibly different rather than both being "a result".
+
+---
+
+## How it works
+
+```mermaid
+flowchart TD
+    subgraph build["Build the index — hours once, minutes weekly"]
+        SF["Scryfall bulk data"] --> ING["ingest<br/>cards keyed on oracle_id<br/>arts keyed on illustration_id"]
+        ED["EDHREC pages"] --> ING
+        ING --> CROP["art crops<br/>one JPEG per artwork"]
+        CROP --> VIS["describe<br/>one vision call per artwork"]
+        VIS --> LIT["literal layer<br/>only what a camera records"]
+        VIS --> INT["interpretive layer<br/>only what a camera cannot"]
+        LIT --> PROPS["about 25 atomic propositions per artwork"]
+        INT --> PROPS
+        PROPS --> IDX["embed<br/>one float32 matrix + one BM25 index"]
+    end
+
+    subgraph query["Answer a query — every search"]
+        Q["free-text theme"] --> ROUTE["route<br/>literal / interpretive weights<br/>plus slot and mechanical filters"]
+        ROUTE --> DEC["decomposed expansion<br/>what a matching image would contain"]
+        ROUTE --> DIR["direct expansion<br/>the theme in interpretive register"]
+        DEC --> RL["dense + BM25 over literal props"]
+        DIR --> RI["dense + BM25 over interpretive props"]
+        RL --> RRF["reciprocal rank fusion<br/>scaled by the routed layer weight"]
+        RI --> RRF
+        RRF --> COL["collapse to the best artwork per commander"]
+        COL --> FIL["power band and colour filters"]
+        FIL --> JUD["judge<br/>continuous 0-1 fit, cited prop ids"]
+        JUD --> VER["verify the finalists with eyes<br/>fresh vision call on the real art"]
+        VER --> DIV["colour cap + MMR for diversity"]
+        DIV --> OUT["a pool of commanders,<br/>each with the printing that earned it"]
+    end
+
+    IDX -.-> RL
+    IDX -.-> RI
+```
+
+### Two layers, opposite rules
+
+The vision model is shown one cropped illustration and nothing else — never the card name, never the oracle text,
+never the set or artist. It writes two layers under rules that are exact opposites:
+
+> **LITERAL** — Only what a camera records. No inference, no story, no mood, no names. Every statement must be one
+> that two careful strangers looking at this image would both agree is true.
+>
+> **INTERPRETIVE** — Only what a camera cannot record. Mood, implied story, power, genre, register, analogy. Here
+> you are permitted to be wrong. You are not permitted to be vague.
+>
+> — <code>cts/prompts.py</code>
+
+Mixing them would poison both. A merged description starts asserting beards it inferred from *wizened elder*, and
+buries the mood signal in factual noise. Kept apart, the literal layer records the evidence and the interpretive
+layer says what the evidence adds up to — and a reader can disagree with the entire interpretation while still
+trusting every literal statement.
+
+### Two routes, always both
+
+For anything with interpretive weight, the query is expanded twice and both expansions are searched:
+
+- **Direct** → 6–8 restatements in interpretive register (*"conveys isolation and quiet resignation"*), searched
+  against the interpretive propositions. Fast, but it only works if the vision pass happened to note that dimension.
+- **Decomposed** → the concrete physical evidence a matching image would actually contain (*"a single figure with
+  their back turned"*, *"cold desaturated palette, blues and greys"*), searched against the literal propositions.
+
+The decomposed route is what makes genuinely novel abstract themes work. It does not require the vision pass to
+have anticipated the concept — only to have recorded the evidence, which the literal layer does exhaustively by
+construction.
+
+### One artwork, not one card
+
+Retrieval runs at the artwork level and collapses to the card level only at the very end, keeping each commander's
+single best-scoring printing. Collapsing earlier would average one matching art together with five non-matching
+ones and bury the hit. A commander appears in the pool at most once, represented by the exact printing that earned
+its place — and every link in the result follows *that* printing.
+
+<details>
+<summary><b>The schema in one diagram</b> — everything visual hangs off <code>illustration_id</code>, everything mechanical off <code>oracle_id</code></summary>
+
+<br>
+
+```mermaid
+erDiagram
+    cards ||--o{ arts : "one commander, many artworks"
+    arts ||--o| descriptions : "two layers, once described"
+    descriptions ||--o{ props : "explodes into propositions"
+    props ||--o| embeddings : "one float32 vector each"
+    cards ||--o| edhrec : "themes, deck count, price"
+    cards ||--o| power : "score plus components"
+
+    cards {
+        TEXT oracle_id PK "gameplay identity"
+        TEXT color_identity "sorted WUBRG"
+        REAL cmc
+        INTEGER edhrec_rank
+    }
+    arts {
+        TEXT illustration_id PK "the artwork itself"
+        TEXT oracle_id FK "which commander"
+        INTEGER face_index "0 front, 1 back"
+        TEXT set_code
+        TEXT artist
+        TEXT scryfall_uri "of this printing"
+    }
+    descriptions {
+        TEXT illustration_id PK
+        TEXT literal "dense factual paragraph"
+        TEXT interpretive "mood, narrative, style"
+        TEXT slots "JSON, every key always present"
+        INTEGER prompt_version
+    }
+    props {
+        INTEGER id PK
+        TEXT layer "literal or interpretive"
+        TEXT text
+    }
+```
+
+Deduplication is on `illustration_id`, not on card id and not on set code. Reprints reuse artwork, so deduping on
+printing would describe identical images for hours; deduping on card would throw away exactly the alternate arts
+this project exists to search. Back faces of transforming commanders are indexed as their own `arts` rows with
+`face_index = 1`.
+
+Four more tables — `queries`, `retrievals`, `judgments`, `preferences` — exist to accumulate training data. See
+[Training your own models](#training-your-own-models).
+
+</details>
+
+<details>
+<summary><b>The retrieval details</b> — fusion, filters, and how every stage degrades</summary>
+
+<br>
+
+- **Fusion.** Each `(expansion, method)` list is ranked separately; each artwork contributes only its best-ranked
+  proposition; the contribution is `weight / (60 + rank)` where `weight` is the routed weight of that proposition's
+  layer. Raw dense and BM25 scores are never normalised against each other — only their ranks are ever compared.
+- **Scale.** 200 propositions inspected per list, 100 candidates handed to the judge in batches of 10, top 8
+  verified with a fresh vision call, `k` returned (default 5).
+- **Both routes always count.** Route weights are floored at 0.05 before retrieval, so a route that runs never
+  contributes exactly nothing.
+- **Slot filters soft-fail.** A structured filter that empties the pool is dropped and reported, rather than
+  returning nothing. The retriever already searches the full text of every literal statement; a wrong hard filter
+  deletes correct answers outright.
+- **Cited evidence is checked.** The judge must cite the numbered propositions it relied on. Ids that do not belong
+  to that candidate are confabulations — they are dropped and counted, and a rationale that can cite nothing scores
+  low by construction.
+- **Diversity.** At most two results per colour identity, then MMR (λ = 0.7) over the matched artworks' mean
+  proposition vectors, so a theme that attracts one visual convention does not return five of it.
+- **Degradation is explicit.** Router unreachable → 0.5/0.5 with no filters, noted in the output. Embedding call
+  fails → BM25 only, noted. Judge batch fails twice → retrieval order kept with a null fit, never a fake number.
+  Vision model unreachable → results stay unverified and say so.
+
+</details>
+
+---
+
+## Quickstart
+
+**1. Get the models.** These are the examples in `config.toml`; nothing is hardcoded, so swap them freely.
+
+```bash
+ollama pull qwen2.5vl:7b      # vision_model — must be multimodal; bigger is better here
+ollama pull nomic-embed-text  # embed_model  — must be an embedding model, not a chat model
+ollama pull qwen3:8b          # judge_model  — routing, expansion, judging; text-only is fine
+```
+
+**2. Install.** Three runtime dependencies; everything else is standard library.
+
+```bash
+git clone https://github.com/DarrellBest/ScryingPool.git
+cd ScryingPool
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**3. Configure.** Edit `config.toml`: `ollama_url`, the three model names, `db_path`, `art_dir`, and the
+`[power_weights]` table. Every command also takes `--config PATH` if you keep it elsewhere.
+
+**4. Build the index.**
+
+```bash
+python -m cts ingest                # Scryfall + EDHREC + power scores + art crops
+python -m cts describe --limit 20   # taste test: read these 20 by hand before committing hours
+python -m cts describe              # the full corpus
+python -m cts embed                 # one vector per proposition
+```
+
+**5. Scry.**
+
+```bash
+python -m cts search "commanders that look lonely" --band 3
+python -m cts search "art that feels like the moment right before a betrayal" --colors WUB -k 8
+python -m cts search "looks like a woodcut" --json | jq '.results[].links.art_crop'
+```
+
+### Honest time expectations
+
+| Stage | Roughly | Why |
+| :-- | :-- | :-- |
+| `ingest` — Scryfall bulk | minutes | One ~75 MB compressed download, skipped entirely when the bulk `updated_at` has not moved. |
+| `ingest` — EDHREC | **~45 min** | ~2,500 commanders at 1 request/second, by choice. Every response is cached to `data/edhrec/`, so re-runs and parser changes cost nothing. |
+| `ingest` — power scores | seconds | Pure SQL and numpy. |
+| `ingest` — art crops | ~10 min | 4,000–5,000 downloads, 100 ms apart. Files already on disk are skipped. |
+| `describe` | **hours — plan an overnight run** | One vision call per artwork over the whole corpus. Default printings are processed first, so an interrupted run still covers every commander before it goes deep on any of them. Interrupt and re-run freely; it resumes. |
+| `embed` | minutes | Batches of 32, skipping propositions that already have a vector. |
+| `search` | one query at a time | Router call, two expansion calls, retrieval, judge batches, then up to 8 vision calls. Local model speed dominates. |
+
+<sub>Corpus size is the specification's estimate — about 2,500 commanders and 4,000–5,000 distinct artworks —
+and <code>cts ingest</code> prints the real counts plus the ten commanders with the most distinct arts as a dedup
+sanity check.</sub>
+
+---
+
+## Command reference
+
+Every stage is idempotent and resumable: each one selects the rows that lack its output, processes them, and
+commits per row.
+
+| Command | What it does | Flags |
+| :-- | :-- | :-- |
+| `cts ingest` | Scryfall bulk → `cards` + `arts`, EDHREC enrichment, power scores, art-crop downloads | — |
+| `cts describe` | The vision pass: two description layers per artwork, exploded into propositions | `--limit N`, `--backfill-stale` |
+| `cts embed` | Embeds every proposition that has no vector yet | — |
+| `cts search "QUERY"` | Route, expand twice, retrieve, judge, verify with eyes, print the pool | `--band 1..5`, `--colors WUBRG`, `-k N`, `--json` |
+| `cts refresh` | The weekly idempotent update. Preflights Ollama, exits non-zero on failure | — |
+| `cts eval` | Runs `eval/queries.jsonl` and scores it | `--collect-prefs` |
+| `cts synth` | Generates the synthetic theme corpus from the descriptions | `--limit N` |
+| `cts export-training` | Writes a JSONL training set | `--target embed\|judge` *(required)*, `--out DIR` |
+
+Prefix everything with `python -m` — for example `python -m cts search "commanders with beards"`. The global
+`--config PATH` goes before the subcommand: `python -m cts --config /etc/cts.toml refresh`.
+
+Notes on two of them:
+
+- **`describe --backfill-stale`** also re-describes artworks written by an older `prompt_version`. This is the
+  explicit path after a prompt change, and it is deliberately *not* part of `refresh`.
+- **`export-training --out`** is a **directory**, not a file. Each target writes two files into it —
+  `<target>_train.jsonl` and `<target>_val.jsonl`. The default is `exports/`. Pointing `--out` at an existing
+  non-directory path is rejected with an explanation rather than silently clobbering it.
+
+---
+
+## What every result carries
+
+Built in one place (`cts/links.py`) so the CLI and any downstream consumer share a single definition. A reference
+that cannot be built is **omitted**, never guessed and never emitted as a broken link.
+
+| Field | Source | Keyed on |
+| :-- | :-- | :-- |
+| **EDHREC page** | `https://edhrec.com/commanders/<slug>` — and only a slug that already returned 200 is ever stored | the card |
+| **EDHREC theme page** | The strongest matched archetype, `/commanders/<slug>/<theme-slug>`, drawn from the subset EDHREC actually publishes a page for | the card |
+| **Scryfall page** | `arts.scryfall_uri` of the **matched printing** | the artwork |
+| **TCGplayer** | `arts.tcgplayer_uri` of the matched printing — alternate arts differ in price by orders of magnitude | the artwork |
+| **Art crop** | `arts.art_crop_url`, so you can eyeball in one click whether the match is real | the artwork |
+| **Set and artist** | `arts.set_code` and `arts.artist`, printed alongside so it is obvious which version is meant | the artwork |
+
+For a query about what a card *depicts*, the art is the primary evidence and the justification text is secondary —
+which is why the crop is always there.
+
+`--json` emits the whole thing: the routing plan, the index size, the counts at each stage, the full judged pool
+(including candidates the vision pass rejected, marked as such) and every link, so results can be piped somewhere
+else without reparsing pretty-printed output. Diagnostics go to stderr, so `--json` stays clean.
+
+---
+
+## The weekly refresh
+
+New commanders arrive in bursts at set releases and precon drops, and EDHREC deck counts drift continuously.
+`python -m cts refresh` is one idempotent entry point for all of it — and it is **not** a rebuild.
+
+1. **Preflight first.** Ping `{ollama_url}/api/tags` and confirm all three configured models are pulled. If Ollama
+   is down it exits non-zero having changed nothing, rather than recomputing power scores over cards that can never
+   get descriptions this run.
+2. **Bulk data.** Compares Scryfall's `updated_at` against the stored value and skips the download when it has not
+   moved. Only genuinely new cards are inserted.
+3. **EDHREC for the whole corpus**, not just new cards — deck counts and archetype tags move for everything.
+4. **Power scores for every card**, because the score is relative to the corpus distribution and one new commander
+   shifts everyone.
+5. **Art, vision and embeddings keyed on new `illustration_id` values**, not new cards. This is the distinction
+   that makes the refresh actually work: Secret Lairs, precon alt-arts and reprint sets attach brand-new artwork to
+   commanders that have been in the database for years, and a "new cards only" check would silently skip every one
+   of them. Artwork is immutable, so an already-described `illustration_id` is never re-described. **A quiet week
+   does zero vision calls.**
+6. **Indexes** are rebuilt from scratch at load time — cheaper at this size than maintaining incremental state.
+
+No surprise backfills: a `prompt_version` bump never re-describes the corpus from inside the weekly job. That is
+`python -m cts describe --backfill-stale`, run deliberately.
+
+The run ends with a summary naming the new commanders it found, EDHREC rows updated, vision calls made and total
+runtime — and stamps `last_refresh_at` into the `meta` table, so *"did the timer actually fire on Sunday?"* is one
+SQL query.
+
+### Scheduling
+
+```bash
+./install-timer.sh --dry-run   # print the unit files, touch nothing
+./install-timer.sh             # write them, daemon-reload, enable --now, list the timer
+```
+
+It writes `~/.config/systemd/user/cts-refresh.{service,timer}` — `OnCalendar=Sun 03:00`, `Persistent=true`,
+`RandomizedDelaySec=1800` — deriving the repo path and interpreter from where the script actually lives, and
+preferring `.venv/bin/python` when it exists.
+
+**Why systemd and not cron:** `Persistent=true` runs a missed job if the machine was off on Sunday, systemd refuses
+to start a `oneshot` service that is already running so a long refresh cannot overlap itself, and output lands in
+journald instead of a redirect you forgot to set up. The randomised delay spreads the EDHREC requests off the hour,
+which is basic courtesy given every other scraper on earth is also scheduled at 03:00.
+
+Afterwards: `loginctl enable-linger "$USER"` so the timer fires without an active login session, and
+`systemctl --user start cts-refresh.service` once by hand before trusting the schedule.
+
+---
+
+## Evaluation
+
+This system's output is subjective, so a broken pipeline and a working one produce results that look equally
+plausible until someone opens the images. `eval/queries.jsonl` holds **40 held-out queries**, committed to the
+repository, deliberately split three ways:
+
+| Block | Count | Scored by | Examples |
+| :-- | :-: | :-- | :-- |
+| **Literal** | 15 | Recall against a hand-built gold set, measured twice: inside the retrieval pool *and* inside the returned top 5. Those two numbers fail for completely different reasons and are never merged. | `commanders that are cat-headed humanoids`, `commanders standing in snow or on ice` |
+| **Abstract** | 15 | Precision at 5, from an operator opening the art crop and marking each result acceptable. Marks persist as `judgments` with `source='human'`, keyed on the artwork, so the second run of the week is not interactive. | `quietly menacing rather than overtly evil`, `would work as a 1970s prog rock gatefold sleeve` |
+| **Adversarial** | 10 | Nothing to optimise. Run them, print what came back, record the shape of the failure. | `art with exactly seven figures in it`, `art that depicts Urza` |
+
+```bash
+python -m cts eval                  # score everything, non-interactive runs never block
+python -m cts eval --collect-prefs  # also collect pairwise preferences on abstract themes
+```
+
+Pairwise preferences are the only reliable way to measure something with no ground truth: two artworks and a theme,
+pick the better fit. They are far more consistent than absolute scoring, they are cheap to give, and they double as
+training data. Every report pins `prompt_version`, the three model names and the index build time, so a regression
+can be traced to what changed, and lands in `eval/results/<timestamp>.json`.
+
+> [!IMPORTANT]
+> Every gold set in `eval/queries.jsonl` currently carries `"gold_verified": false` — the names were written from
+> knowledge of the cards, not from opening all 4,000-odd crops. The eval prints **UNVERIFIED gold** in its summary
+> until they are checked by hand. Treat literal recall as directional until then.
+
+---
+
+## Training your own models
+
+Optional, and strictly a power-user path — the search works without ever touching it. But every query, retrieval,
+judgment and preference is already logged, because the corpus is designed to become training data.
+
+<details>
+<summary><b>The dataset is the asset</b> — how the exports are built and why they are shaped that way</summary>
+
+<br>
+
+```bash
+python -m cts synth                          # generate themes forward, from the art
+python -m cts export-training --target embed # contrastive triples
+python -m cts export-training --target judge # task-tagged SFT records
+```
+
+**Cold start.** `cts synth` feeds both description layers of every artwork to the judge model and asks which themes
+it *genuinely* satisfies — spanning literal, compositional, affective and analogical on purpose — plus a few
+near-miss themes it almost satisfies. Themes are generated **forward, from the art**: sampling a theme list and
+searching for matches would inherit whatever bias the retriever already has, so training on it would only sharpen
+the existing failure modes.
+
+**`--target embed`** writes `(query, positive, negatives)` triples for `MultipleNegativesRankingLoss`. The hard
+negatives carry almost all the value — an artwork that was retrieved and then rejected was semantically close and
+wrong, which is exactly the distinction the base embedding model cannot make. The artwork side of each pair is a
+few propositions, not the whole record, because at inference each proposition is embedded and matched on its own.
+
+**`--target judge`** writes one multi-task set covering **route**, **decompose** and **judge**, each with a task tag
+in the instruction. They share the underlying skill of knowing what an abstract art theme means in this domain, and
+one adapter is one thing to serve. The judge half is **balanced to near 50/50 accept/reject by construction** — a
+judge trained mostly on positives becomes a yes-machine and quietly destroys precision, which is the single most
+common way this kind of fine-tune fails. The exporter warns loudly if the ratio leaves 0.40–0.60, or if fewer than
+three registers are represented.
+
+**Both split by query text, never by artwork.** The split is a hash of the normalised query text, so every record
+about a theme lands in the same file in this run and every future one. The skill that has to generalise is
+understanding a theme it has never seen — an artwork in both splits is harmless, a theme in both makes the
+evaluation meaningless. Human-sourced rows are emitted three times, because most trainers have no per-example
+weight argument and duplication is how a row gets weighted; they encode what *you* meant by a theme rather than
+what a model guessed you meant.
+
+**Intended adapter.** One LoRA over routing, decomposition and judging, around rank 32 / alpha 64, following the
+base model cookbook's default target modules rather than inventing new ones. Retrieval is the real bottleneck, so
+the embedding model is worth training first: an artwork the retriever never surfaces cannot be rescued by any
+judge. And the adapter is disposable — the export is not.
+
+</details>
+
+---
+
+## Known limits
+
+Stated plainly, because a search engine that hides its failure modes is worse than one that names them.
+
+- **Text in art.** Vision models at art-crop resolution hallucinate plausible words on banners and tomes, or miss
+  legible text entirely, and they conflate *"writing is present"* with *"writing is legible"*. Two adversarial eval
+  queries exist to size that error, not to fix it.
+- **Counting past a handful.** `figure_count` is reliable at one to three and guesswork above about five. The
+  prompt asks for exact counts up to ten and estimates above that, so *"a large host"* is findable by phrase but
+  *"exactly seven figures"* is not.
+- **Named characters.** The vision pass is **name-blind by design** — it never sees the card name, oracle text, set
+  or artist, and is explicitly told not to name characters or infer lore. No proposition can therefore say *Urza*.
+  Ask for Urza and the judge, which does know Magic, will confabulate matches out of generic robed-artificer
+  evidence. This is a deliberate trade: naming the card would collapse every alternate art of a commander toward
+  one generic description and destroy the distinctions the whole system exists to index.
+- **Visually similar species.** Elves whose ears are hidden read as human; dwarves, gnomes, halflings and short
+  humans all read as *short bearded humanoid*; the literal layer records *large canine* and cannot tell a wolf from
+  a werewolf from a dog. Often the distinction is not visually determinable at all.
+- **Grist-type commanders are excluded.** The ingest filter is exactly `legalities.commander == "legal"` **and**
+  (`"Legendary Creature"` in the type line **or** `"can be your commander"` in the rules text). *Grist, the Hunger
+  Tide* is legal in the command zone via the type-changing rules but matches neither clause, so it is not indexed.
+  Planeswalker commanders carrying the explicit sentence (the Commander 2014 cycle and friends) are included
+  normally.
+- **`edhrec.avg_price` is the commander card's own market price**, not the average deck price. EDHREC's JSON does
+  not expose a deck price anywhere; the card's price is the closest available proxy and preserves the intent — a
+  price percentile as a power signal.
+- **The cEDH flag saturates.** EDHREC tags at least one cEDH deck for very nearly every commander that has a page
+  at all, so a literal presence flag is 1 for most of the corpus and mostly restates deck count. The flag is still
+  computed literally rather than being silently redefined, the power stage prints the percentage of the corpus it
+  fired on, and `cedh_share` and `bracket5_share` sit unweighted in `power.components` ready for a continuous term
+  whenever you want to retune — no re-fetch required.
+
+---
+
+## Project layout
+
+```text
+ScryingPool/
+├── cts/
+│   ├── __main__.py         the CLI; every handler imports its stage lazily
+│   ├── config.py           config.toml → one frozen dataclass, loaded at startup
+│   ├── db.py               SQLite connection, the whole schema, meta helpers
+│   ├── ollama.py           the entire model layer: generate, vision, embed, preflight
+│   ├── ingest.py           Scryfall bulk → cards + arts, deduped on illustration_id
+│   ├── edhrec.py           themes, archetypes, deck counts, price; every response cached
+│   ├── power.py            composite power score, components stored beside it
+│   ├── art.py              one art crop per artwork, streamed to .part then renamed
+│   ├── prompts.py          the two-layer vision prompt, its JSON schema, PROMPT_VERSION
+│   ├── describe.py         the vision pass: resumable, defaults before alternates
+│   ├── embed.py            propositions → float32 vectors
+│   ├── index.py            one matrix + one BM25 index over the same rows, built at load
+│   ├── search.py           route, expand twice, retrieve, fuse, collapse, filter, print
+│   ├── judge.py            score with cited evidence, verify with eyes, diversify
+│   ├── links.py            one definition of every reference a result carries
+│   ├── evaluate.py         the held-out query set and its metrics
+│   ├── synth.py            the synthetic theme corpus
+│   └── export_training.py  the JSONL training sets
+├── eval/
+│   ├── queries.jsonl       40 hand-written queries — committed
+│   └── results/            one JSON report per eval run — generated
+├── assets/                 README artwork
+├── config.toml             Ollama URL, model names, paths, power weights
+├── install-timer.sh        writes and enables the systemd user timer
+├── requirements.txt        requests, numpy, rank_bm25 — that is all
+├── data/                   generated: SQLite db, art crops, EDHREC cache, bulk dump
+└── exports/                generated: training JSONL
+```
+
+---
+
+## Data sources and attribution
+
+**Scryfall** — card data, printings and art crops, via the public `bulk-data` endpoint and the art-crop image CDN.
+Scrying Pool is unaffiliated with and unendorsed by Scryfall. Requests are rate-limited by design and identify
+themselves with a real `User-Agent`: bulk data is downloaded only when its `updated_at` has changed, and art crops
+are fetched 100 ms apart and skipped when already on disk.
+
+**EDHREC** — deck counts, theme tags, deck archetypes and card price. Also unaffiliated and unendorsed. Requests
+are made no faster than one per second and every raw response is cached to `data/edhrec/`, so re-runs and parser
+changes cost EDHREC nothing.
+
+**Card artwork** is © its individual artists. Scrying Pool stores local crops purely to index them, always names
+the artist and set alongside a result, and links back to the exact printing that matched.
+
+**Wizards of the Coast** — Scrying Pool is unofficial Fan Content permitted under the Fan Content Policy. Not
+approved or endorsed by Wizards. Portions of the materials used are property of Wizards of the Coast.
+© Wizards of the Coast LLC.
+
+**Licence** — this repository does not currently include a `LICENSE` file, so no licence is granted by default.
+If you would like to use the code, open an issue and ask.
+
+<div align="center">
+<br>
+<sub>🔮 &nbsp;Built to be read, argued with, and re-run locally.</sub>
+</div>

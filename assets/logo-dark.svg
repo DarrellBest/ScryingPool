@@ -29,9 +29,9 @@
     <ellipse cx="80" cy="106" rx="21" ry="6" stroke-width="2" opacity="0.66"/>
   </g>
 
-  <path d="M63 108 C63 92 67 81 72 72 C75 60 80 51 80 51 C80 51 85 60 88 72 C93 81 97 92 97 108 Z" fill="#07121e"/>
-  <ellipse cx="80" cy="72" rx="5.4" ry="7" fill="#7ab6d8" opacity="0.6"/>
-  <path d="M72 72 C75 60 80 51 80 51" fill="none" stroke="#cfeafb" stroke-width="1.6" stroke-linecap="round" opacity="0.6"/>
+  <path d="M61 108 C61 93 65 82 70 74 C71 61 75 54 80 54 C85 54 89 61 90 74 C95 82 99 93 99 108 Z" fill="#07121e"/>
+  <ellipse cx="80" cy="71" rx="5.6" ry="7.2" fill="#7ab6d8" opacity="0.6"/>
+  <path d="M70 74 C71 61 75 54 80 54" fill="none" stroke="#cfeafb" stroke-width="1.6" stroke-linecap="round" opacity="0.6"/>
 
   <path d="M14.2 56.1 A70 70 0 0 1 56.1 14.2" fill="none" stroke="#eaf7ff" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
   <circle cx="80" cy="80" r="70" fill="none" stroke="#7fc4e8" stroke-width="3" opacity="0.8"/>
