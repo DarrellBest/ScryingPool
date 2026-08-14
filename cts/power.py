@@ -145,6 +145,7 @@ def _fetch_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     except sqlite3.OperationalError:
         return conn.execute(_SELECT.format(brackets="NULL")).fetchall()
 
+
 _UPSERT = """
 INSERT INTO power (oracle_id, score, components)
 VALUES (?, ?, ?)
