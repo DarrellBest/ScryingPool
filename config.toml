@@ -1,0 +1,55 @@
+# Scrying Pool configuration.
+# Edit the values below, then run `python -m cts ingest`.
+# Every command takes `--config PATH` if you keep this somewhere else.
+
+# Base URL of your running Ollama server (no trailing slash).
+ollama_url = "http://localhost:11434"
+
+# --- Models -------------------------------------------------------------
+# These are working examples for a typical Ollama install — swap freely.
+# No model name is hardcoded anywhere in the code; `python -m cts refresh`
+# preflights these three against /api/tags before doing any work.
+# Pull them first, e.g. `ollama pull qwen2.5vl:7b`.
+
+# Vision model. Reads each art crop and writes the two description layers
+# (Phase 5). Must be multimodal. Bigger is better here — this pass is the
+# highest-leverage step in the project and nothing downstream can recover a
+# detail it failed to record.
+vision_model = "qwen2.5vl:7b"
+
+# Embedding model. Embeds every proposition (Phase 6). Must be an embedding
+# model, not a chat model. Changing this invalidates the stored vectors:
+# clear the `embeddings` table and re-run `python -m cts embed`.
+embed_model = "nomic-embed-text"
+
+# Judge / router model. Query routing, theme expansion, candidate judging and
+# the synthetic theme corpus (Phases 7, 8, 12). Text-only is fine.
+judge_model = "qwen3:8b"
+
+# --- Storage ------------------------------------------------------------
+
+# SQLite database. Parent directories are created automatically.
+db_path = "data/commanders.db"
+
+# Art crops are downloaded to <art_dir>/<illustration_id>.jpg
+art_dir = "data/art"
+
+# --- Power score weights (Phase 3) --------------------------------------
+# The composite power score blends four components, each normalized across the
+# corpus and stored separately in power.components so weights can be retuned
+# without recomputing anything. Bands are five quantile buckets over the final
+# score, computed at query time.
+[power_weights]
+
+# Normalized log of EDHREC deck count. Popularity, not power — but it is the
+# strongest single signal available, so it carries the most weight.
+deck_count = 0.4
+
+# Average deck price percentile. Expensive decks correlate with strong staples.
+price = 0.25
+
+# Average mana value of the commander itself. Cheap commanders do more, sooner.
+cmc = 0.2
+
+# cEDH presence flag, when EDHREC exposes one. Rare but highly informative.
+cedh = 0.15

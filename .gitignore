@@ -1,0 +1,14 @@
+# Generated data: SQLite db, art crops, EDHREC cache, Scryfall bulk dumps.
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Training exports land at the repo root by default (Phase 12).
+# Root-anchored so eval/queries.jsonl stays committed.
+/*.jsonl

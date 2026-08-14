@@ -1,0 +1,5 @@
+# Scrying Pool runtime dependencies.
+# Everything else is stdlib (Python 3.11+ required: tomllib, sqlite3).
+requests>=2.31
+numpy>=1.26
+rank_bm25>=0.2.2
