@@ -80,10 +80,10 @@ def run(cfg: Config) -> int:
     if problem is not None:
         print(f"refresh: {problem}")
         return 1
-    print(
-        "refresh: preflight ok — "
-        f"{cfg.vision_model}, {cfg.embed_model}, {cfg.judge_model} all present"
-    )
+    names = [cfg.vision_model, cfg.embed_model, cfg.judge_model]
+    if cfg.verify_model and cfg.verify_model not in names:
+        names.append(cfg.verify_model)
+    print(f"refresh: preflight ok — {', '.join(names)} all present")
 
     # Stage modules are imported here rather than at module scope so that a
     # module which is missing or fails to import reports itself as a named

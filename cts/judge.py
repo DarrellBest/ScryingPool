@@ -6,15 +6,15 @@ Retrieval optimizes recall; everything here is precision. Three stages:
    artwork's* two description layers and its propositions, citing the prop ids it
    relied on. A rationale that cannot point at a proposition is one the model invented,
    so invented ids are dropped and counted.
-2. `verify_finalists` — the top eight go back to the vision model against the actual
-   art crop. Everything upstream reasons over a description written by another model
-   at another time; this is the only stage that can catch a detail the vision pass
-   compressed away.
+2. `verify_finalists` — the top eight go back to a multimodal model (`verify_model`)
+   against the actual art crop. Everything upstream reasons over a description written
+   by another model at another time; this is the only stage that can catch a detail the
+   vision pass compressed away.
 3. `diversify` — colour cap plus MMR, so a theme that attracts one visual convention
    does not return five of it.
 
 Every stage degrades instead of crashing: a failed batch falls back to retrieval
-order with a null fit, and an unreachable vision model leaves results unverified and
+order with a null fit, and an unreachable verify model leaves results unverified and
 says so.
 """
 
@@ -397,8 +397,16 @@ def verify_finalists(
 ) -> tuple[list[dict], bool]:
     """Re-check the best candidates against the real image. Returns (results, available).
 
+    Uses `cfg.verify_model`, not `cfg.vision_model`. The two default to the same
+    name, but they are different jobs: `vision_model` writes the exhaustive
+    descriptions in Phase 5 and wants to be as large as the card allows, whereas
+    this stage asks one binary "does this claim hold for this image" question per
+    finalist. Pointing both at an 81 GB model means it cannot be co-resident with
+    the judge, so every search swaps models in and out of VRAM ~17 times. See
+    config.toml.
+
     A rejection removes the candidate from selection but stays in the pool, marked, so
-    `--json` still shows what happened. If the vision model is unreachable the whole
+    `--json` still shows what happened. If the verify model is unreachable the whole
     stage is skipped after the first failure — results stay unverified and the caller
     reports that rather than pretending they were checked.
     """
@@ -414,7 +422,7 @@ def verify_finalists(
         try:
             raw = ollama.vision(
                 cfg,
-                cfg.vision_model,
+                cfg.verify_model,
                 prompt,
                 str(art_path),
                 format=VERIFY_SCHEMA,
@@ -424,7 +432,7 @@ def verify_finalists(
             # Infrastructure failure, not a verdict: stop calling and degrade.
             available = False
             print(
-                f"verify: vision model unavailable ({exc}); keeping judge ordering "
+                f"verify: verify model unavailable ({exc}); keeping judge ordering "
                 "and marking results unverified",
                 file=sys.stderr,
             )

@@ -805,6 +805,10 @@ def execute(
                     "judge": cfg.judge_model,
                     "embed": cfg.embed_model,
                     "vision": cfg.vision_model,
+                    # The model this search actually put in front of the art crops.
+                    # Defaults to vision_model; logged separately so a plan from a
+                    # run with a distinct verify_model is still self-describing.
+                    "verify": cfg.verify_model,
                 },
                 "index": {
                     "props": len(index),

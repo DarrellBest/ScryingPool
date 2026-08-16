@@ -8,7 +8,7 @@ ollama_url = "http://localhost:11434"
 # --- Models -------------------------------------------------------------
 # These are working examples for a typical Ollama install — swap freely.
 # No model name is hardcoded anywhere in the code; `python -m cts refresh`
-# preflights these three against /api/tags before doing any work.
+# preflights each distinct name below against /api/tags before doing any work.
 # Pull them first, e.g. `ollama pull qwen2.5vl:7b`.
 
 # Vision model. Reads each art crop and writes the two description layers
@@ -16,6 +16,34 @@ ollama_url = "http://localhost:11434"
 # highest-leverage step in the project and nothing downstream can recover a
 # detail it failed to record.
 vision_model = "qwen3.5:122b"
+
+# Verification model. The one multimodal call per finalist at the end of a search
+# ("does this theme genuinely hold for this image, yes/no" — see judge.py's
+# verify_finalists). Optional: when unset it falls back to vision_model, which is
+# what every config written before this key existed does.
+#
+# Set it separately because the two jobs have opposite requirements. vision_model
+# writes 5,530 open-ended descriptions once, and wants to be as large as the card
+# allows. This one answers ~8 binary questions per query, forever, and its size is
+# paid on every search.
+#
+# The reason that matters is VRAM coexistence, not raw speed. A search interleaves
+# ~10 judge_model calls with ~7 verify calls. On a 96 GB card, judge (24 GiB) and
+# qwen3.5:122b (81 GiB) sum to 105 GiB and cannot both be resident, so Ollama
+# evicts and reloads between every single call — measured at ~71s of the ~156s mean
+# query, roughly 46% of wall clock spent loading weights that were just unloaded.
+# Pointing verify_model at the judge model makes it literally the same resident
+# instance: one load, zero evictions.
+#
+# Measured on 60 real finalists against qwen3.5:122b as reference: qwen3.6 agrees
+# 70% overall, but 100% on the compositional queries where careful looking is the
+# whole point (counting figures, reading inscriptions, "walking away" vs "standing
+# still"). Its disagreements are concentrated on "commanders that are <species>"
+# themes, and inspecting those crops by hand shows the 81 GB model is usually the
+# one in the wrong there — it reads "commander" as requiring a military figure and
+# rejects artwork that plainly matches. gemma4:31b scored the same 70% overall but
+# only 80% on the compositional set, and is ~2.5x slower per call.
+verify_model = "qwen3.6:latest"
 
 # Embedding model. Embeds every proposition (Phase 6). Must be an embedding
 # model, not a chat model. Changing this invalidates the stored vectors:

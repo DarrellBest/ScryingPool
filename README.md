@@ -309,13 +309,23 @@ corpus. Nothing is hardcoded, so swap them freely.
 ollama pull qwen3.5:122b      # vision_model — must be multimodal; bigger is better here
 ollama pull nomic-embed-text  # embed_model  — must be an embedding model, not a chat model
 ollama pull qwen3.6           # judge_model  — routing, expansion, judging; text-only is fine
+                              # judge_model doubles as verify_model; see below
 ```
 
 `qwen3.5:122b` is an 81 GB download and wants a large-VRAM card. It earns that only on a full `describe`
 run, where the description quality it produces is the ceiling on everything downstream. If you are taking
-the prebuilt corpus below, the descriptions are already written and the vision model is used only for the
-handful of verification calls per search — a smaller multimodal model such as `qwen2.5vl:7b` is a sensible
-trade there. `embed_model` is the one that must match: changing it invalidates the shipped vectors.
+the prebuilt corpus below, the descriptions are already written and the only multimodal work left is the
+handful of verification calls per search. That is what `verify_model` is for: it defaults to `vision_model`,
+and setting it to something smaller is the single highest-value knob on search latency.
+
+`config.toml` ships with `verify_model = "qwen3.6:latest"` — the same model as `judge_model`, deliberately.
+A search interleaves ~10 judge calls with ~7 verification calls, so if the two models cannot be resident at
+once (24 GiB + 81 GiB on a 96 GB card) Ollama evicts and reloads between every call. Measured on this
+machine that was ~71s of a ~156s query, about 46% of wall clock spent moving weights. Pointing both keys at
+one model makes it one resident instance: **~100s per query instead of ~180s, and zero evictions.** On 60
+real finalists it agreed with `qwen3.5:122b` on 100% of the compositional questions (counting figures,
+reading inscriptions, "walking away" vs "standing still") — see `config.toml` for the full breakdown.
+`embed_model` is the one that must match: changing it invalidates the shipped vectors.
 
 **2. Install.** Three runtime dependencies; everything else is standard library.
 
@@ -390,11 +400,12 @@ optional piece; `--help` lists the rest.
 `data/bulk/` is deliberately not shipped — it is a re-downloadable Scryfall dump that `ingest` fetches itself.
 No model weights are shipped either: all three are public Ollama registry models, pulled by name.
 
-**On the models.** `config.toml` ships with the three this corpus was actually built on. Only `embed_model`
+**On the models.** `config.toml` ships with the models this corpus was actually built on. Only `embed_model`
 has to match to reuse the shipped vectors — changing it invalidates every stored embedding. `judge_model` and
-`vision_model` are swapped freely, and the vision model is only consulted for the eight verification calls at
-the end of a search, so a much smaller multimodal model is a reasonable trade if `qwen3.5:122b` will not fit
-on your card.
+`vision_model` are swapped freely. If you are reusing the shipped corpus you never run `describe` at all, so
+`vision_model` is never called and only `verify_model` needs to be multimodal — it is consulted for the eight
+verification calls at the end of a search. Leave it pointed at `judge_model` (the shipped default) unless you
+have VRAM to spare, since that is what keeps the two from evicting each other.
 
 <sub>The published corpus was described in a single ~16-hour pass with <code>qwen3.5:122b</code> on an
 RTX PRO 6000 Blackwell (96 GB). Time scales with the vision model and the card, not with anything clever

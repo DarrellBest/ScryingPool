@@ -320,6 +320,7 @@ def run(cfg: Config, collect_prefs: bool = False) -> dict:
         "prompt_version": prompt_version,
         "models": {
             "vision": cfg.vision_model,
+            "verify": cfg.verify_model,
             "embed": cfg.embed_model,
             "judge": cfg.judge_model,
         },

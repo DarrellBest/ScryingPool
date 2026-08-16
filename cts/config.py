@@ -25,6 +25,7 @@ DEFAULT_ART_DIR = "data/art"
 class Config:
     ollama_url: str
     vision_model: str
+    verify_model: str
     embed_model: str
     judge_model: str
     db_path: str
@@ -47,6 +48,10 @@ def load_config(path: str = "config.toml") -> Config:
 
     Missing model names default to "" — cts.ollama.preflight reports them
     rather than failing here, so read-only commands still work.
+
+    `verify_model` is the one exception: when it is absent or blank it falls back
+    to `vision_model`, which is what every config written before the key existed
+    gets. See config.toml for why the two are worth separating.
     """
     p = Path(path)
     if not p.is_file():
@@ -66,9 +71,11 @@ def load_config(path: str = "config.toml") -> Config:
             print("Fix the syntax, or copy a fresh config.toml and re-edit it.", file=sys.stderr)
             raise SystemExit(1) from None
 
+    vision_model = str(raw.get("vision_model", ""))
     return Config(
         ollama_url=str(raw.get("ollama_url", DEFAULT_OLLAMA_URL)).rstrip("/"),
-        vision_model=str(raw.get("vision_model", "")),
+        vision_model=vision_model,
+        verify_model=str(raw.get("verify_model", "")).strip() or vision_model,
         embed_model=str(raw.get("embed_model", "")),
         judge_model=str(raw.get("judge_model", "")),
         db_path=str(raw.get("db_path", DEFAULT_DB_PATH)),

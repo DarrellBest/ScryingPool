@@ -155,11 +155,17 @@ def preflight(cfg: Config) -> list[str]:
                 present.add(_normalize(value))
 
     missing: list[str] = []
-    configured = (
+    configured = [
         ("vision_model", cfg.vision_model),
         ("embed_model", cfg.embed_model),
         ("judge_model", cfg.judge_model),
-    )
+    ]
+    # verify_model defaults to vision_model, and the overwhelmingly common case is
+    # that they are the same string. Only a genuinely distinct value earns its own
+    # check — otherwise an unset vision_model would be reported twice, once under
+    # each name, which reads like two separate problems.
+    if _normalize(cfg.verify_model) != _normalize(cfg.vision_model):
+        configured.append(("verify_model", cfg.verify_model))
     for key, name in configured:
         label = name if name.strip() else f"<{key} not set in config.toml>"
         if (not name.strip() or _normalize(name) not in present) and label not in missing:
