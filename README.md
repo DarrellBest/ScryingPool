@@ -290,13 +290,20 @@ Four more tables — `queries`, `retrievals`, `judgments`, `preferences` — exi
 
 ## Quickstart
 
-**1. Get the models.** These are the examples in `config.toml`; nothing is hardcoded, so swap them freely.
+**1. Get the models.** These are what `config.toml` ships with — the same three that built the published
+corpus. Nothing is hardcoded, so swap them freely.
 
 ```bash
-ollama pull qwen2.5vl:7b      # vision_model — must be multimodal; bigger is better here
+ollama pull qwen3.5:122b      # vision_model — must be multimodal; bigger is better here
 ollama pull nomic-embed-text  # embed_model  — must be an embedding model, not a chat model
-ollama pull qwen3:8b          # judge_model  — routing, expansion, judging; text-only is fine
+ollama pull qwen3.6           # judge_model  — routing, expansion, judging; text-only is fine
 ```
+
+`qwen3.5:122b` is an 81 GB download and wants a large-VRAM card. It earns that only on a full `describe`
+run, where the description quality it produces is the ceiling on everything downstream. If you are taking
+the prebuilt corpus below, the descriptions are already written and the vision model is used only for the
+handful of verification calls per search — a smaller multimodal model such as `qwen2.5vl:7b` is a sensible
+trade there. `embed_model` is the one that must match: changing it invalidates the shipped vectors.
 
 **2. Install.** Three runtime dependencies; everything else is standard library.
 
