@@ -343,6 +343,44 @@ python -m cts search "looks like a woodcut" --json | jq '.results[].links.art_cr
 and <code>cts ingest</code> prints the real counts plus the ten commanders with the most distinct arts as a dedup
 sanity check.</sub>
 
+### Or skip the build: `./setup.sh`
+
+The expensive part of this project is the `describe` pass, and its output is just data. A prebuilt copy is
+published, so you can have a working index in the time it takes to download a gigabyte instead of the time it
+takes to run 5,530 vision calls.
+
+```bash
+git clone https://github.com/DarrellBest/ScryingPool.git
+cd ScryingPool
+./setup.sh
+```
+
+It checks its prerequisites (Python 3.11+, `tar`, `curl` or `wget`, and an Ollama server answering at the
+`ollama_url` in `config.toml`), creates `.venv` and installs `requirements.txt`, pulls whichever three models
+`config.toml` names — skipping any already pulled — then downloads, sha256-verifies and extracts the archives
+below into `data/`. Every step is idempotent, so re-running is cheap, and it will **not** overwrite anything
+already in `data/` that it did not put there unless you pass `--force`. `--no-edhrec-cache` drops the largest
+optional piece; `--help` lists the rest.
+
+| Archive | Size | Contents | sha256 |
+| :-- | --: | :-- | :-- |
+| [`scryingpool-db.tar.gz`](https://u.pcloud.link/publink/show?code=XZsq4VJZgGjGooPF9u74mEsybOH9Cbo3aTgX) | 557 MiB | `data/commanders.db` — 3,202 commanders, 5,530 described artworks, 170,487 embedded propositions | `b0d8b833cb117d8c82c05fcdcd0045319bc459037d33dc70c5eeb79b55f3055b` |
+| [`scryingpool-art.tar.gz`](https://u.pcloud.link/publink/show?code=XZDq4VJZIPnO7mynBjRjOc3zsINTIhDr4x8X) | 365 MiB | `data/art/` — the 5,530 art crops, needed for the vision verification pass | `6bd0d1994e7770bdb002fad613a0bbb0d4c37f8ab9d9e0ec0f0861a558fb1dff` |
+| [`scryingpool-edhrec-cache.tar.gz`](https://u.pcloud.link/publink/show?code=XZ1q4VJZ4dEerExbkn4uh3lCxmKNf5wnGNFX) | 74 MiB | `data/edhrec/` — 3,169 cached responses; optional, but skipping it costs ~45 min of rate-limited scraping on the first `ingest` | `014961e1e83750f4caffe636b9ba630b6b630cde11a612ddf0d655567d2300ec` |
+
+`data/bulk/` is deliberately not shipped — it is a re-downloadable Scryfall dump that `ingest` fetches itself.
+No model weights are shipped either: all three are public Ollama registry models, pulled by name.
+
+**On the models.** `config.toml` ships with the three this corpus was actually built on. Only `embed_model`
+has to match to reuse the shipped vectors — changing it invalidates every stored embedding. `judge_model` and
+`vision_model` are swapped freely, and the vision model is only consulted for the eight verification calls at
+the end of a search, so a much smaller multimodal model is a reasonable trade if `qwen3.5:122b` will not fit
+on your card.
+
+<sub>The published corpus was described in a single ~16-hour pass with <code>qwen3.5:122b</code> on an
+RTX PRO 6000 Blackwell (96 GB). Time scales with the vision model and the card, not with anything clever
+in this repo — a 7B model is far quicker and noticeably less observant, which is the whole trade.</sub>
+
 ---
 
 ## Command reference
