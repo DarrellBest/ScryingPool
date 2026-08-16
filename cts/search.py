@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 import numpy as np
 import requests
 
-from . import db, judge as judge_mod, ollama
+from . import db, judge as judge_mod, ollama, slotvocab
 from .config import Config
 from .index import SearchIndex, load_index, tokenize
 from .links import links_for
@@ -111,6 +111,14 @@ their compact JSON. held_objects serializes as
   [{{"object":"lantern","is_weapon":false}}]
 so "holding something that isn't a weapon" is contains with value "is_weapon":false,
 and "holding a weapon" is contains with value "is_weapon":true.
+
+Every slot holds FREE DESCRIPTIVE TEXT written by a vision pass that was never told
+which card it was looking at. There is no enum anywhere: no slot has a fixed set of
+allowed values, and a snake_case token like "low_angle_shot" is not one. Write the words
+a describer would have written.
+{vocabulary}
+Write plain lowercase words. One idea per filter: "winged" and "feathered wings" as two
+filters, never "angel with feathered wings" as one.
 Only add a filter when the query states a requirement that is certain to be recorded in
 that slot, and prefer no filter at all over a shaky one — the retriever already searches
 the full text of every literal statement, while a wrong filter deletes correct answers
@@ -165,10 +173,19 @@ def _clean_slot_filters(raw, notes: list[str]) -> list[dict]:
     return filters
 
 
-def route(cfg: Config, query: str) -> dict:
-    """One judge_model call returning the retrieval plan. Never raises."""
+def route(cfg: Config, query: str, vocabulary: str = "") -> dict:
+    """One judge_model call returning the retrieval plan. Never raises.
+
+    `vocabulary` is the slot vocabulary summary from slotvocab.router_hint: without it
+    the router invents categorical values ("goblin", "low_angle_shot") that no stored
+    slot has ever held.
+    """
     notes: list[str] = []
-    prompt = ROUTER_PROMPT.format(query=query, paths=", ".join(SLOT_PATHS))
+    prompt = ROUTER_PROMPT.format(
+        query=query,
+        paths=", ".join(SLOT_PATHS),
+        vocabulary=("\n" + vocabulary + "\n") if vocabulary else "",
+    )
     last_error = ""
 
     for attempt in (1, 2):
@@ -337,54 +354,76 @@ def expand(cfg: Config, query: str, plan: dict) -> list[dict]:
 # ------------------------------------------------------------------------ slot filters
 
 
-def _slot_clause(flt: dict) -> tuple[str, list]:
-    """One json_extract condition over descriptions.slots.
+MIN_FILTERED_POOL = 25  # a conjunction must still leave the judge something to rank
 
-    List-valued slots (held_objects, other_figures, palette) come back from
-    json_extract as their JSON text, so `contains` matches inside the serialized list.
-    """
-    path = "$." + flt["path"]
-    op, value = flt["op"], flt["value"]
-    field = "json_extract(slots, ?)"
-    if op == "equals":
-        return f"lower(CAST({field} AS TEXT)) = lower(?)", [path, value]
-    if op == "contains":
-        return f"lower(CAST({field} AS TEXT)) LIKE '%' || lower(?) || '%'", [path, value]
-    if op == "not_contains":
-        # `field` appears twice, so `path` must be bound twice.
-        return (
-            f"({field} IS NULL OR lower(CAST({field} AS TEXT)) NOT LIKE '%' || lower(?) || '%')",
-            [path, path, value],
-        )
-    if op == "gte":
-        return f"CAST({field} AS REAL) >= CAST(? AS REAL)", [path, value]
-    return f"CAST({field} AS REAL) <= CAST(? AS REAL)", [path, value]
+
+def _filter_label(flt: dict) -> str:
+    return f"{flt['path']} {flt['op']} {flt['value']!r}"
 
 
 def allowed_illustrations(
-    conn: sqlite3.Connection, filters: list[dict], notes: list[str]
+    conn: sqlite3.Connection,
+    filters: list[dict],
+    notes: list[str],
+    vocab: slotvocab.SlotVocabulary | None = None,
 ) -> set[str] | None:
     """Illustration ids passing every slot filter, or None when unfiltered.
 
-    Soft-fail: a filter that empties the pool is dropped rather than returning nothing.
+    Matching runs against the normalized slot vocabulary rather than raw SQL string
+    equality — see slotvocab for why the raw comparison could never match.
+
+    Each filter is evaluated on its own before the conjunction is formed. The previous
+    version intersected everything and then popped the *last* filter whenever the
+    result was empty, so the note blamed whichever filter happened to be listed last
+    rather than the one that actually matched nothing: `not_contains 'human'`, which
+    matches thousands of artworks, was reported as matching none.
+
+    Filters are then applied broadest first, and one is dropped as soon as applying it
+    would leave fewer than MIN_FILTERED_POOL artworks. A slot filter is a hard mask over
+    the whole corpus, and the slots it masks on are *independently incomplete*: an
+    angel's wings land in `species` for one artwork and in `clothing` for another, so
+    ANDing "species contains angel" with "clothing contains feathered wings" describes
+    no single describer's habits and cuts 94 real matches down to 2. Below the floor the
+    constraint is handed to the retriever instead, which ranks on the same words without
+    deleting anything — measured on the eval's gold sets, a filter that survives to 13
+    artworks costs more recall than it buys. Dropping is always reported.
     """
-    active = list(filters)
-    while active:
-        clauses, params = [], []
-        for flt in active:
-            clause, values = _slot_clause(flt)
-            clauses.append(clause)
-            params.extend(values)
-        rows = conn.execute(
-            f"SELECT illustration_id FROM descriptions WHERE {' AND '.join(clauses)}", params
-        ).fetchall()
-        if rows:
-            return {r["illustration_id"] for r in rows}
-        dropped = active.pop()
-        note = f"slot filter {dropped['path']} {dropped['op']} {dropped['value']!r} matched nothing; dropped"
+    if not filters:
+        return None
+    vocab = vocab or slotvocab.load(conn)
+
+    scored: list[tuple[dict, set[str]]] = []
+    for flt in filters:
+        matched = vocab.match(flt)
+        if matched:
+            scored.append((flt, matched))
+            continue
+        note = f"slot filter {_filter_label(flt)} matched nothing; dropped"
         print(f"filter: {note}", file=sys.stderr)
         notes.append(note)
-    return None
+
+    allowed: set[str] | None = None
+    kept: list[str] = []
+    for flt, matched in sorted(scored, key=lambda pair: -len(pair[1])):
+        label = _filter_label(flt)
+        merged = matched if allowed is None else allowed & matched
+        if len(merged) < MIN_FILTERED_POOL:
+            where = "on its own" if allowed is None else "with the filters already applied"
+            note = (
+                f"slot filter {label} matched {len(matched)} artworks but would leave "
+                f"only {len(merged)} {where}; dropped, the retriever ranks on it instead"
+            )
+            print(f"filter: {note}", file=sys.stderr)
+            notes.append(note)
+            continue
+        allowed = merged
+        kept.append(f"{label} -> {len(matched)}")
+
+    if allowed is not None:
+        note = f"slot filters kept {len(allowed)} artworks ({'; '.join(kept)})"
+        print(f"filter: {note}", file=sys.stderr)
+        notes.append(note)
+    return allowed
 
 
 # --------------------------------------------------------------------------- retrieval
@@ -726,7 +765,10 @@ def execute(
         index = load_index(cfg, conn)
 
     try:
-        plan = route(cfg, query)
+        # Built from data already stored; the router needs it before it can emit a slot
+        # filter that has any chance of matching.
+        vocab = slotvocab.load(conn)
+        plan = route(cfg, query, slotvocab.router_hint(vocab))
         notes: list[str] = plan["notes"]
 
         # Both routes run whenever the theme has interpretive weight, so a route we
@@ -781,7 +823,7 @@ def execute(
             return {"query_id": query_id, "plan": plan, "relaxed": None, "results": [], "pool": []}
 
         expansions = expand(cfg, query, plan)
-        allowed = allowed_illustrations(conn, plan["slot_filters"], notes)
+        allowed = allowed_illustrations(conn, plan["slot_filters"], notes, vocab)
         query_vecs = _query_vectors(cfg, [e["text"] for e in expansions], notes)
 
         fused, per_method, best_layer = retrieve(index, expansions, weights, query_vecs, allowed)

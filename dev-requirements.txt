@@ -1,0 +1,4 @@
+# Test-only dependencies. The test suite never calls Ollama and never touches the
+# network: run it with `python -m pytest` from the repository root.
+-r requirements.txt
+pytest>=8.0

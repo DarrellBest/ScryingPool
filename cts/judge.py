@@ -73,9 +73,11 @@ JUDGE_RULES = """Rules:
   throws away the only information that makes a pool rankable.
   1.0 unmistakable, 0.7 strong, 0.5 real but partial, 0.3 a stretch, 0.0 unrelated.
 - rationale is ONE sentence about this specific image, concrete, no hedging.
-- prop_ids are the bracketed numbers from THIS candidate's propositions, and only the
-  ones you actually relied on. Never invent an id, never cite another candidate's. If
-  nothing in the propositions supports the theme, return an empty list and a low fit.
+- prop_ids are the bracketed numbers you actually relied on, copied exactly. Every
+  candidate header states the only range of numbers that candidate may cite — a number
+  outside its own range belongs to a different image and is always wrong. Check each
+  number against that range before you write it. Copy digits, do not reconstruct them.
+  If nothing in the propositions supports the theme, return an empty list and a low fit.
 - When a candidate is marked with more than one art in the index, name the printing
   (set code and artist) in your rationale: "Atraxa fits" is misleading when only one of
   six printings does.
@@ -150,8 +152,33 @@ def chunks(items: list, size: int):
 # --------------------------------------------------------------------------- judging
 
 
-def render_candidate(number: int, cand: dict, evidence: dict) -> str:
+def number_batch(batch: list[dict], evidence: dict[str, dict]) -> list[dict]:
+    """Give every proposition in one batch a short id, numbered from 1.
+
+    Propositions carry their global `props.id`, which is a six-digit number. Asking a
+    model to copy ten candidates' worth of six-digit ids exactly, and to keep straight
+    which candidate each belongs to, is the source of Defect 2: the ids it returned
+    were frequently near-misses or a neighbouring candidate's. Renumbering per batch
+    replaces them with one- to three-digit ids that are still globally unique *within
+    the prompt*, so a stray citation is still detectable as belonging to another
+    candidate rather than silently accepted, and the mapping back to the real prop id
+    is exact.
+    """
+    views: list[dict] = []
+    next_id = 1
+    for cand in batch:
+        props = (evidence.get(cand["illustration_id"]) or {}).get("props") or []
+        numbered = []
+        for prop in props[:MAX_PROPS_SHOWN]:
+            numbered.append((next_id, prop))
+            next_id += 1
+        views.append({"candidate": cand, "numbered": numbered})
+    return views
+
+
+def render_candidate(number: int, view: dict, evidence: dict) -> str:
     """One candidate block: name, printing, both layers, numbered propositions."""
+    cand = view["candidate"]
     lines = [f"CANDIDATE {number} — {cand.get('name') or cand['oracle_id']}"]
     printing = f"  printing: {cand.get('set_code') or '?'} · art by {cand.get('artist') or 'unknown'}"
     art_count = int(cand.get("art_count") or 1)
@@ -160,19 +187,25 @@ def render_candidate(number: int, cand: dict, evidence: dict) -> str:
     lines.append(printing)
     lines.append(f"  literal: {evidence.get('literal') or '(none recorded)'}")
     lines.append(f"  interpretive: {evidence.get('interpretive') or '(none recorded)'}")
-    lines.append("  propositions:")
-    props = evidence.get("props") or []
-    if not props:
-        lines.append("    (none recorded)")
-    for prop in props[:MAX_PROPS_SHOWN]:
-        lines.append(f"    [{prop['id']}] ({prop['layer']}) {prop['text']}")
+
+    numbered = view["numbered"]
+    if not numbered:
+        lines.append("  propositions: (none recorded)")
+        lines.append(f"  CANDIDATE {number} may cite NO prop_ids at all.")
+        return "\n".join(lines)
+
+    low, high = numbered[0][0], numbered[-1][0]
+    span = str(low) if low == high else f"{low}-{high}"
+    lines.append(f"  propositions (CANDIDATE {number} may cite ONLY ids {span}):")
+    for display_id, prop in numbered:
+        lines.append(f"    [{display_id}] ({prop['layer']}) {prop['text']}")
     return "\n".join(lines)
 
 
-def build_judge_prompt(query: str, batch: list[dict], evidence: dict[str, dict]) -> str:
+def build_judge_prompt(query: str, views: list[dict], evidence: dict[str, dict]) -> str:
     blocks = [
-        render_candidate(i + 1, cand, evidence.get(cand["illustration_id"], {}))
-        for i, cand in enumerate(batch)
+        render_candidate(i + 1, view, evidence.get(view["candidate"]["illustration_id"], {}))
+        for i, view in enumerate(views)
     ]
     return (
         f'THEME: "{query}"\n\n'
@@ -194,7 +227,8 @@ def _fallback_entry(cand: dict, reason: str) -> dict:
 
 def judge_batch(cfg: Config, query: str, batch: list[dict], evidence: dict[str, dict]) -> list[dict]:
     """Judge up to BATCH_SIZE candidates in one call. Retries once, then degrades."""
-    prompt = build_judge_prompt(query, batch, evidence)
+    views = number_batch(batch, evidence)
+    prompt = build_judge_prompt(query, views, evidence)
     last_error = ""
     for attempt in (1, 2):
         try:
@@ -209,7 +243,7 @@ def judge_batch(cfg: Config, query: str, batch: list[dict], evidence: dict[str, 
             entries = parse_json(raw).get("judgments")
             if not isinstance(entries, list) or not entries:
                 raise ValueError("no judgments array in response")
-            return _apply_entries(batch, evidence, entries)
+            return _apply_entries(views, entries)
         except (ValueError, RuntimeError, requests.RequestException) as exc:
             last_error = str(exc)
             if attempt == 1:
@@ -222,8 +256,15 @@ def judge_batch(cfg: Config, query: str, batch: list[dict], evidence: dict[str, 
     return [_fallback_entry(c, "not judged: judge model unavailable for this batch") for c in batch]
 
 
-def _apply_entries(batch: list[dict], evidence: dict[str, dict], entries: list) -> list[dict]:
-    """Attach one model entry per candidate, validating fits and cited prop ids."""
+def _apply_entries(views: list[dict], entries: list) -> list[dict]:
+    """Attach one model entry per candidate, validating fits and cited prop ids.
+
+    Citations are resolved against the batch-local numbering, and the two ways of
+    getting one wrong are counted separately: a number belonging to another candidate
+    in the same prompt (misattributed) and a number that was never shown at all
+    (invented). Both are dropped; only the counts differ, and they say different things
+    about the model.
+    """
     by_number: dict[int, dict] = {}
     for position, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -234,8 +275,14 @@ def _apply_entries(batch: list[dict], evidence: dict[str, dict], entries: list) 
             number = position + 1
         by_number.setdefault(number, entry)
 
+    shown: dict[int, int] = {}
+    for view in views:
+        for display_id, prop in view["numbered"]:
+            shown[display_id] = prop["id"]
+
     results: list[dict] = []
-    for i, cand in enumerate(batch):
+    for i, view in enumerate(views):
+        cand = view["candidate"]
         entry = by_number.get(i + 1)
         if entry is None:
             results.append(_fallback_entry(cand, "not judged: missing from judge response"))
@@ -247,17 +294,19 @@ def _apply_entries(batch: list[dict], evidence: dict[str, dict], entries: list) 
             fit = 0.0
         fit = min(1.0, max(0.0, fit))
 
-        # A cited id that does not belong to this candidate is a confabulation; drop it.
-        own = {p["id"] for p in evidence.get(cand["illustration_id"], {}).get("props", [])}
-        cited, invented = [], 0
+        own = {display_id: prop["id"] for display_id, prop in view["numbered"]}
+        cited: list[int] = []
+        invented = misattributed = 0
         for value in entry.get("prop_ids") or []:
             try:
-                pid = int(value)
+                display_id = int(value)
             except (TypeError, ValueError):
                 invented += 1
                 continue
-            if pid in own:
-                cited.append(pid)
+            if display_id in own:
+                cited.append(own[display_id])
+            elif display_id in shown:
+                misattributed += 1
             else:
                 invented += 1
 
@@ -269,7 +318,9 @@ def _apply_entries(batch: list[dict], evidence: dict[str, dict], entries: list) 
                 "rationale": rationale or "(no rationale returned)",
                 "prop_ids": cited,
                 "judged": True,
-                "invented_prop_ids": invented,
+                "invented_prop_ids": invented + misattributed,
+                "misattributed_prop_ids": misattributed,
+                "cited_prop_ids": len(cited) + invented + misattributed,
             }
         )
     return results
@@ -290,9 +341,17 @@ def judge_batches(
     judged: list[dict] = []
     for batch in chunks(candidates, batch_size):
         judged.extend(judge_batch(cfg, query, batch, evidence))
-    invented = sum(int(r.get("invented_prop_ids") or 0) for r in judged)
-    if invented:
-        print(f"judge: dropped {invented} cited prop ids that did not belong", file=sys.stderr)
+    dropped = sum(int(r.get("invented_prop_ids") or 0) for r in judged)
+    misattributed = sum(int(r.get("misattributed_prop_ids") or 0) for r in judged)
+    total = sum(int(r.get("cited_prop_ids") or 0) for r in judged)
+    if dropped:
+        rate = f" ({dropped / total:.1%} of {total} citations)" if total else ""
+        print(
+            f"judge: dropped {dropped} cited prop ids that did not belong{rate}"
+            f" — {misattributed} belonged to another candidate, {dropped - misattributed} "
+            "were never shown",
+            file=sys.stderr,
+        )
     return judged
 
 

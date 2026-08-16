@@ -272,12 +272,24 @@ Four more tables — `queries`, `retrievals`, `judgments`, `preferences` — exi
   verified with a fresh vision call, `k` returned (default 5).
 - **Both routes always count.** Route weights are floored at 0.05 before retrieval, so a route that runs never
   contributes exactly nothing.
-- **Slot filters soft-fail.** A structured filter that empties the pool is dropped and reported, rather than
-  returning nothing. The retriever already searches the full text of every literal statement; a wrong hard filter
-  deletes correct answers outright.
-- **Cited evidence is checked.** The judge must cite the numbered propositions it relied on. Ids that do not belong
-  to that candidate are confabulations — they are dropped and counted, and a rationale that can cite nothing scores
-  low by construction.
+- **Slot filters are matched against the vocabulary that exists.** The vision pass is name-blind, so it writes
+  *"green-skinned humanoid with pointed ears"* where a query says *goblin* — compared as strings those never
+  intersect. Filters are therefore matched on a normalised view of the stored slots, and creature-type words are
+  expanded through a map mined from the corpus itself: every artwork belongs to a card whose type line already
+  names its creature types, so counting which descriptive phrases co-occur with which type recovers
+  *goblin → green-skinned humanoid* from data already on disk, with no second vision pass. Association is kept
+  only where support and lift make it real, which is why *dwarf* — a type the vision pass never recorded
+  distinguishably — still matches nothing instead of matching a guess.
+- **Slot filters soft-fail.** A structured filter is a hard mask over the corpus, so it is applied only while it
+  still leaves the judge a real pool to rank — below that floor the constraint is handed to the retriever, which
+  ranks on the same words without deleting anything. Each filter is judged on its own before the conjunction is
+  formed, so the report names the filter that actually failed rather than whichever was listed last.
+- **Cited evidence is checked.** The judge must cite the numbered propositions it relied on. Propositions are
+  renumbered per batch as short ids with each candidate's permitted range stated in its header — copying a
+  six-digit global id ten candidates at a time is what produced the confabulations — and the numbering stays
+  unique across the batch so a stray citation is still detectable rather than silently accepted. Ids that do not
+  belong to that candidate are dropped and counted, split by whether they belonged to another candidate or were
+  never shown at all, and a rationale that can cite nothing scores low by construction.
 - **Diversity.** At most two results per colour identity, then MMR (λ = 0.7) over the matched artworks' mean
   proposition vectors, so a theme that attracts one visual convention does not return five of it.
 - **Degradation is explicit.** Router unreachable → 0.5/0.5 with no filters, noted in the output. Embedding call
