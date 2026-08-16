@@ -15,7 +15,7 @@ ollama_url = "http://localhost:11434"
 # (Phase 5). Must be multimodal. Bigger is better here — this pass is the
 # highest-leverage step in the project and nothing downstream can recover a
 # detail it failed to record.
-vision_model = "qwen2.5vl:7b"
+vision_model = "qwen3.5:122b"
 
 # Embedding model. Embeds every proposition (Phase 6). Must be an embedding
 # model, not a chat model. Changing this invalidates the stored vectors:
@@ -24,7 +24,7 @@ embed_model = "nomic-embed-text"
 
 # Judge / router model. Query routing, theme expansion, candidate judging and
 # the synthetic theme corpus (Phases 7, 8, 12). Text-only is fine.
-judge_model = "qwen3:8b"
+judge_model = "qwen3.6:latest"
 
 # --- Storage ------------------------------------------------------------
 

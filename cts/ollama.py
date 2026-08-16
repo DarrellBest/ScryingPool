@@ -53,8 +53,13 @@ def generate(
     options: dict | None = None,
     timeout: int = 300,
 ) -> str:
-    """Single-shot completion. `format` is a JSON schema dict or the string "json"."""
-    body: dict = {"model": model, "prompt": prompt, "stream": False}
+    """Single-shot completion. `format` is a JSON schema dict or the string "json".
+
+    Sends think=False: hybrid-thinking models (every vision/text model pulled
+    for this project so far) otherwise put the whole structured answer in the
+    `thinking` field and leave `response` empty.
+    """
+    body: dict = {"model": model, "prompt": prompt, "stream": False, "think": False}
     if system is not None:
         body["system"] = system
     if format is not None:
@@ -74,7 +79,8 @@ def vision(
     options: dict | None = None,
     timeout: int = 600,
 ) -> str:
-    """Same as generate(), with one base64-encoded image attached."""
+    """Same as generate(), with one base64-encoded image attached. See generate()
+    for why think=False is sent."""
     try:
         raw = Path(image_path).read_bytes()
     except OSError as exc:
@@ -84,6 +90,7 @@ def vision(
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "images": [base64.b64encode(raw).decode("ascii")],
     }
     if format is not None:
