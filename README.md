@@ -513,6 +513,123 @@ Afterwards: `loginctl enable-linger "$USER"` so the timer fires without an activ
 
 ---
 
+## Running it as a service
+
+Everything above is a CLI on the machine that holds the corpus. `serve/` is an **optional** layer that puts the same
+search behind `/scry` in Discord, so it can be run from a phone. It is two systemd *user* units:
+
+| Unit | What it is | Listens on |
+| :-- | :-- | :-- |
+| `scrying-api.service` | uvicorn over `cts.search.execute`. Holds the connection, the index and the warm models between requests. | `127.0.0.1:8077`, and nothing else |
+| `scrying-bot.service` | discord.py. Holds no corpus state at all. | nothing — it dials **out** to Discord |
+
+The bot dialling out is the point: there is no port to forward, no tunnel to run and no login page to write, and
+Discord already knows who everyone is, so the identity problem is solved by not having it.
+
+**The API binds loopback and refuses to do otherwise.** `SCRYING_API_ADDR` is validated in code, not defaulted —
+anything but `127.0.0.1` or `::1` and the process exits with an error naming why. If you want this from another
+machine, the answer is Tailscale, not a wider bind.
+
+### Install
+
+```bash
+.venv/bin/pip install -r requirements.txt -r serve-requirements.txt
+serve/install-services.sh --dry-run    # print the unit files, touch nothing
+serve/install-services.sh              # write them, daemon-reload, enable --now both
+loginctl enable-linger "$USER"         # so both survive logout
+```
+
+Same conventions as `install-timer.sh`: the repo path and the interpreter are derived from where the script actually
+lives, `.venv/bin/python` is preferred, and the absolute path is baked into `ExecStart` because a user unit inherits
+almost no environment.
+
+`requirements.txt` stays at its three packages. The README's "no cloud, no vector database, no framework" claim is
+about the search engine, and it stays true — the framework is in this layer, which is optional and separate.
+
+### Credentials
+
+One file, **outside the repo**, mode 600, loaded by `EnvironmentFile=`:
+
+```bash
+install -d -m 700 ~/.config/scrying-pool
+cat > ~/.config/scrying-pool/bot.env <<'EOF'
+SCRYING_DISCORD_TOKEN=...
+SCRYING_API_URL=http://127.0.0.1:8077
+SCRYING_DISCORD_GUILD_ID=...
+EOF
+chmod 600 ~/.config/scrying-pool/bot.env
+```
+
+Never in the repo, never in a unit file, never in a shell script, never a default in Python. Outside the repo
+entirely, so a token can never ride along in a `git add -A`.
+
+`SCRYING_DISCORD_GUILD_ID` is optional and is not a secret. Set it and `/scry` is registered as a **guild** command,
+which appears in that server the instant the bot starts. Leave it unset and the command registers globally, which
+works everywhere the bot is invited but can take up to an hour to propagate to clients.
+
+Invite the bot with scopes `bot` and `applications.commands` — no permissions and **no privileged intents**. Slash
+commands do not need Message Content, so the developer portal needs no special toggles; a privileged-intent
+checkbox nobody flipped is the most common setup snag and this bot deliberately avoids it.
+
+### Using it
+
+```
+/scry theme:<text> [k:1-5] [band:1-5] [colors:<WUBRG>]
+```
+
+The search takes **76.8s on average and 106.7s at worst**, and none of that is hidden. The bot acknowledges the
+interaction immediately (Discord kills one that is not acknowledged within 3 seconds), posts `🔮 scrying… ~80s`,
+and then edits that same message in place when the results arrive. One message, edited twice, no follow-up spam.
+
+Each result is one embed: name and mana cost, colour identity, **Popularity band n/5**, the fit score, the judge's
+one-line rationale, the art crop as a thumbnail, and EDHREC / theme / Scryfall / TCGplayer links. Results that fall
+below the 0.5 fit bar are sorted last, coloured differently and titled **STRETCH** — a user who asked for five and
+got two real matches sees that at a glance rather than being handed five results that look equally good.
+
+Ten 👍/👎 buttons sit under the message. They write a `judgments` row with `source='discord'`, which is exactly the
+human-marked data `export_training.py` already reads — so using the thing produces training data as a side effect.
+The buttons are **persistent**: their whole identity is encoded in the Discord `custom_id`, not held in the bot's
+memory, so restarting the bot does not leave a channel full of dead buttons.
+
+### Checking it without Discord in the loop
+
+```bash
+curl -s localhost:8077/health | jq
+curl -s localhost:8077/search -H 'content-type: application/json' \
+     -d '{"theme":"a hooded figure alone at dusk","k":3}' | jq '.results[].name'
+journalctl --user -u scrying-api -f
+journalctl --user -u scrying-bot -f
+```
+
+`/health` answers **during** a search — that is the whole reason the search runs on a worker thread rather than on
+the event loop — and reports the index age, the corpus stamp, whether a refresh is running, and what Ollama says is
+resident.
+
+### Searches during the weekly refresh are slow, and nothing is broken
+
+The API holds `judge_model` (~27GB of VRAM) continuously. The refresh's `describe` stage needs `vision_model`
+(81GB). They do not fit on the card together, so Ollama evicts one for the other and a search issued mid-refresh
+ping-pongs between them: minutes rather than ~80s, correct the whole time. `/health` reports it, and the bot's
+placeholder says so up front rather than leaving a four-minute Sunday-morning search unexplained.
+
+Most weekly refreshes never load the vision model at all — `describe` only runs for genuinely new
+`illustration_id`s, and new artwork arrives in bursts every few weeks, not every week.
+
+### Nothing needs restarting after a refresh
+
+The API builds its index once at startup, and the refresh writes new props and embeddings straight into the database
+it is already holding open. Left alone that would serve last week's corpus indefinitely, silently, with results that
+still look plausible.
+
+So before every search — and on a 60-second background poll — the API re-reads a three-value corpus fingerprint
+(`meta.last_refresh_at`, `MAX(props.id)`, `MAX(embeddings.prop_id)`) and rebuilds the index when it moved. The
+rebuild is 4–7 seconds against a wait the user was already told to expect, it happens once after a refresh, and the
+response carries `service.index_rebuilt: true` so the extra seconds are attributable rather than mysterious. If you
+do something the fingerprint cannot see — clear the `embeddings` table, restore a database — there is
+`curl -XPOST localhost:8077/admin/reload`.
+
+---
+
 ## Evaluation
 
 This system's output is subjective, so a broken pipeline and a working one produce results that look equally
@@ -649,6 +766,11 @@ ScryingPool/
 │   ├── evaluate.py         the held-out query set and its metrics
 │   ├── synth.py            the synthetic theme corpus
 │   └── export_training.py  the JSONL training sets
+├── serve/                  optional serving layer — see "Running it as a service"
+│   ├── api.py              FastAPI over search.execute, loopback only, one search at a time
+│   ├── bot.py              the Discord bot: /scry, persistent 👍/👎 buttons
+│   ├── render.py           result dict → Discord embed JSON. Pure, imports no discord
+│   └── install-services.sh writes and enables both systemd user units
 ├── eval/
 │   ├── queries.jsonl       40 hand-written queries — committed
 │   └── results/            one JSON report per eval run — generated
@@ -656,6 +778,7 @@ ScryingPool/
 ├── config.toml             Ollama URL, model names, paths, power weights
 ├── install-timer.sh        writes and enables the systemd user timer
 ├── requirements.txt        requests, numpy, rank_bm25 — that is all
+├── serve-requirements.txt  fastapi, uvicorn, discord.py, httpx — only for serve/
 ├── data/                   generated: SQLite db, art crops, EDHREC cache, bulk dump
 └── exports/                generated: training JSONL
 ```

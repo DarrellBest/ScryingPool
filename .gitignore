@@ -20,3 +20,9 @@ exports/
 # Phase 11 eval run artifacts (one timestamped JSON per run).
 # eval/queries.jsonl is the committed dataset and stays tracked.
 eval/results/
+
+# Belt and braces. The serving layer's secrets live in
+# ~/.config/scrying-pool/bot.env — outside the repo entirely, precisely so a
+# token can never ride along in a `git add -A`. This line is the second layer,
+# for anyone who drops a .env in here anyway.
+*.env
