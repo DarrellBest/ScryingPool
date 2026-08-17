@@ -34,9 +34,9 @@ CONFIG_FILE="$REPO_DIR/config.toml"
 #
 # Built 2026-08-16 from a complete corpus: 3,202 commanders, 5,530 artworks
 # described, 170,487 propositions embedded.
-DB_CODE="XZsq4VJZgGjGooPF9u74mEsybOH9Cbo3aTgX"
-DB_SHA="b0d8b833cb117d8c82c05fcdcd0045319bc459037d33dc70c5eeb79b55f3055b"
-DB_BYTES="583964757"
+DB_CODE="XZQi4VJZoWRa3bLxI3b2yrOtIfymBFUGmPJX"
+DB_SHA="e27653ba0d99ea6c41f24441d9610b98e16feb438ad2f7697da5273c28e88389"
+DB_BYTES="584080873"
 
 ART_CODE="XZDq4VJZIPnO7mynBjRjOc3zsINTIhDr4x8X"
 ART_SHA="6bd0d1994e7770bdb002fad613a0bbb0d4c37f8ab9d9e0ec0f0861a558fb1dff"

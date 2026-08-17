@@ -393,7 +393,7 @@ optional piece; `--help` lists the rest.
 
 | Archive | Size | Contents | sha256 |
 | :-- | --: | :-- | :-- |
-| [`scryingpool-db.tar.gz`](https://u.pcloud.link/publink/show?code=XZsq4VJZgGjGooPF9u74mEsybOH9Cbo3aTgX) | 557 MiB | `data/commanders.db` — 3,202 commanders, 5,530 described artworks, 170,487 embedded propositions | `b0d8b833cb117d8c82c05fcdcd0045319bc459037d33dc70c5eeb79b55f3055b` |
+| [`scryingpool-db.tar.gz`](https://u.pcloud.link/publink/show?code=XZQi4VJZoWRa3bLxI3b2yrOtIfymBFUGmPJX) | 557 MiB | `data/commanders.db` — 3,202 commanders, 5,530 described artworks, 170,487 embedded propositions | `e27653ba0d99ea6c41f24441d9610b98e16feb438ad2f7697da5273c28e88389` |
 | [`scryingpool-art.tar.gz`](https://u.pcloud.link/publink/show?code=XZDq4VJZIPnO7mynBjRjOc3zsINTIhDr4x8X) | 365 MiB | `data/art/` — the 5,530 art crops, needed for the vision verification pass | `6bd0d1994e7770bdb002fad613a0bbb0d4c37f8ab9d9e0ec0f0861a558fb1dff` |
 | [`scryingpool-edhrec-cache.tar.gz`](https://u.pcloud.link/publink/show?code=XZ1q4VJZ4dEerExbkn4uh3lCxmKNf5wnGNFX) | 74 MiB | `data/edhrec/` — 3,169 cached responses; optional, but skipping it costs ~45 min of rate-limited scraping on the first `ingest` | `014961e1e83750f4caffe636b9ba630b6b630cde11a612ddf0d655567d2300ec` |
 
