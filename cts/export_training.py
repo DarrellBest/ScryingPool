@@ -31,6 +31,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from . import db
 from .config import Config
 
 DEFAULT_OUT_DIR = "exports"
@@ -52,9 +53,16 @@ MAX_JUDGE_INPUT_CHARS = 4000
 # without letting them dominate: they encode what *you* meant by a theme rather
 # than what a model guessed you meant, and they are the only rows in the corpus
 # that do.
+#
+# "Human" here means every source in `db.HUMAN_SOURCES` — an operator mark from
+# `cts eval` and a 👍/👎 on a `/scry` result are the same act of judgement and
+# carry the same weight and the same authority.
 HUMAN_WEIGHT = 3
 
-_SOURCE_PRIORITY = {"distill": 1, "judge": 2, "human": 3}
+# Model-written sources only. Anything human outranks all of them; see
+# `_priority`, which is the only thing that should read this map.
+_MODEL_PRIORITY = {"distill": 1, "judge": 2}
+_HUMAN_PRIORITY = max(_MODEL_PRIORITY.values()) + 1
 
 # Registers whose evidence lives in the literal layer. Everything else reads
 # more naturally off the interpretive props.
@@ -178,7 +186,8 @@ def _collect_labels(conn: sqlite3.Connection) -> tuple[dict, dict]:
     Keyed on text rather than query_id because the same theme is logged as a new
     `queries` row on every run; the label is about the artwork. A human mark
     overrides a model's on the same pair, which is the entire point of recording
-    corrections.
+    corrections — and a Discord vote is a human mark (`db.HUMAN_SOURCES`), so it
+    beats the judge's own row for the same artwork rather than losing to it.
     """
     rows = conn.execute(
         """
@@ -214,9 +223,7 @@ def _collect_labels(conn: sqlite3.Connection) -> tuple[dict, dict]:
         }
         key = (key_text, str(row["iid"]))
         previous = labels.get(key)
-        if previous is None or _SOURCE_PRIORITY.get(record["source"], 0) >= _SOURCE_PRIORITY.get(
-            previous["source"], 0
-        ):
+        if previous is None or _priority(record["source"]) >= _priority(previous["source"]):
             labels[key] = record
 
     grouped: dict[str, list[dict]] = {}
@@ -236,8 +243,20 @@ def _load_json(raw) -> object:
         return None
 
 
-def _weight(source: str) -> int:
-    return HUMAN_WEIGHT if source == "human" else 1
+def _priority(source: str | None) -> int:
+    """Dedupe rank for one `judgments.source`. Higher wins the (text, artwork) slot.
+
+    Every human source outranks every model source, and they tie with each
+    other so the later row wins — the same "later marks win" rule
+    `evaluate._stored_marks` uses.
+    """
+    if db.is_human_source(source):
+        return _HUMAN_PRIORITY
+    return _MODEL_PRIORITY.get(source or "", 0)
+
+
+def _weight(source: str | None) -> int:
+    return HUMAN_WEIGHT if db.is_human_source(source) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -664,8 +683,6 @@ def _write_split(records: list[dict], out_dir: Path, target: str) -> dict:
 
 def run(cfg: Config, target: str, out: str | None = None) -> dict:
     """Export the `embed` or `judge` training set. `out` is a directory."""
-    from . import db
-
     if target not in ("embed", "judge"):
         print(f"error: unknown --target {target!r} (expected 'embed' or 'judge')")
         raise SystemExit(2)

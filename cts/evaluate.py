@@ -11,9 +11,10 @@ Three metrics, three query kinds, scored differently on purpose:
                the returned top 5 (did the judge keep it). Those two numbers
                fail for completely different reasons and must not be merged.
   abstract     precision at 5, from an operator opening the art and marking each
-               result acceptable. Marks persist in `judgments` with
-               source='human', keyed on the artwork, so the second run of the
-               week is not interactive at all.
+               result acceptable. Marks persist in `judgments` with a human
+               source (`db.HUMAN_SOURCES`: an `eval` mark or a Discord vote),
+               keyed on the artwork, so the second run of the week is not
+               interactive at all.
   adversarial  no score to optimise; run them, print what came back, and record
                the shape of the failure.
 
@@ -34,6 +35,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import db
 from .config import Config
 
 QUERIES_PATH = "eval/queries.jsonl"
@@ -171,18 +173,22 @@ def _pool_rank_map(conn: sqlite3.Connection, query_id: int | None) -> dict[str, 
 
 
 def _stored_marks(conn: sqlite3.Connection, text: str) -> dict[str, float]:
-    """Operator marks for this query TEXT, keyed on artwork.
+    """Human marks for this query TEXT, keyed on artwork.
 
     Keyed on text, not query_id: every run inserts a fresh `queries` row, but
     the judgment "this artwork does/doesn't fit this theme" is about the
     artwork and survives across runs. Later marks win.
+
+    Every source in `db.HUMAN_SOURCES` counts, not just `human`: a 👍/👎 on a
+    `/scry` result is the same operator making the same call from a phone, and
+    dropping it here would silently shrink the P@5 denominator.
     """
     rows = conn.execute(
-        """
+        f"""
         SELECT j.illustration_id AS iid, j.fit AS fit
           FROM judgments j
           JOIN queries  q ON q.id = j.query_id
-         WHERE j.source = 'human' AND q.text = ?
+         WHERE j.source IN {db.HUMAN_SOURCES_SQL} AND q.text = ?
          ORDER BY j.rowid ASC
         """,
         (text,),
@@ -284,8 +290,6 @@ def _print_result_line(i: int, result: dict, mark: float | None) -> None:
 
 def run(cfg: Config, collect_prefs: bool = False) -> dict:
     """Score eval/queries.jsonl. Returns the report dict that is also written to disk."""
-    from . import db
-
     started_at = datetime.now(timezone.utc)
     queries = load_queries()
     conn = db.connect(cfg)

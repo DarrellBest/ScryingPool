@@ -242,3 +242,88 @@ def test_fetch_health_tolerates_a_slow_or_broken_health():
     assert (got, down) == (None, False)
     got, down = _run(bot.fetch_health(_FakeClient(_FakeResponse(500))))
     assert (got, down) == (None, False)
+
+
+# ------------------------------------------------------------- the global-sync guard
+#
+# `tree.sync()` with no guild does not add a command — it REPLACES the
+# application's entire global command set. A misconfigured process therefore has
+# to be incapable of reaching that call: a missing guild id must mean "register
+# nothing", never "register globally". This is the one bit of gateway-adjacent
+# behaviour worth testing offline, because the way it fails is destroying an
+# application's commands with no error anywhere.
+
+
+def test_sync_plan_refuses_when_nothing_is_configured():
+    assert bot.sync_plan(None, False) == "none"
+
+
+def test_sync_plan_is_guild_scoped_when_a_guild_id_is_set():
+    assert bot.sync_plan(659588470448062464, False) == "guild"
+
+
+def test_sync_plan_goes_global_only_on_the_explicit_opt_in():
+    assert bot.sync_plan(None, True) == "global"
+
+
+def test_a_guild_id_wins_over_the_global_opt_in():
+    """Both set is not ambiguous: the scoped sync is the one that cannot destroy."""
+    assert bot.sync_plan(659588470448062464, True) == "guild"
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on", " 1 "])
+def test_the_opt_in_accepts_the_obvious_affirmatives(raw):
+    assert bot.env_allows_global_sync({bot.ALLOW_GLOBAL_SYNC_ENV: raw}) is True
+
+
+@pytest.mark.parametrize("raw", ["", "0", "false", "no", "maybe", "  "])
+def test_anything_else_is_not_an_opt_in(raw):
+    assert bot.env_allows_global_sync({bot.ALLOW_GLOBAL_SYNC_ENV: raw}) is False
+
+
+def test_an_unset_opt_in_is_not_an_opt_in():
+    assert bot.env_allows_global_sync({}) is False
+
+
+class _RecordingTree:
+    """Records what setup_hook asked Discord to do, without asking Discord."""
+
+    def __init__(self):
+        self.syncs = []
+        self.copied = []
+
+    def copy_global_to(self, *, guild):
+        self.copied.append(guild.id)
+
+    async def sync(self, *, guild=None):
+        self.syncs.append(None if guild is None else guild.id)
+        return []
+
+
+def _hooked(guild_id, allow_global_sync):
+    client = bot.ScryingBot(guild_id=guild_id, allow_global_sync=allow_global_sync)
+    tree = _RecordingTree()
+    client.tree = tree
+    _run(client.setup_hook())
+    return tree
+
+
+def test_setup_hook_syncs_nothing_when_nothing_is_configured(caplog):
+    with caplog.at_level("ERROR", logger="scrying.bot"):
+        tree = _hooked(None, False)
+    assert tree.syncs == []          # the whole point: no call reaches Discord
+    assert tree.copied == []
+    message = caplog.text
+    assert bot.GUILD_ENV in message and bot.ALLOW_GLOBAL_SYNC_ENV in message
+    assert "REPLACES" in message     # it says why, not just that it refused
+
+
+def test_setup_hook_syncs_to_the_guild_when_one_is_set():
+    tree = _hooked(659588470448062464, False)
+    assert tree.syncs == [659588470448062464]
+    assert tree.copied == [659588470448062464]
+
+
+def test_setup_hook_syncs_globally_only_with_the_opt_in():
+    tree = _hooked(None, True)
+    assert tree.syncs == [None]      # None means global, and only here

@@ -73,7 +73,8 @@ if [ ! -f "$ENV_FILE" ]; then
     echo "         Create it, mode 600, with:" >&2
     echo "           SCRYING_DISCORD_TOKEN=..." >&2
     echo "           SCRYING_API_URL=http://127.0.0.1:8077" >&2
-    echo "           SCRYING_DISCORD_GUILD_ID=...   # optional; guild-scoped = instant" >&2
+    echo "           SCRYING_DISCORD_GUILD_ID=...   # guild-scoped = instant; without it" >&2
+    echo "                                          # the bot registers NO commands" >&2
 fi
 
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"

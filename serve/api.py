@@ -210,6 +210,12 @@ def write_feedback(
 ) -> dict:
     """One `judgments` row, `source='discord'`. Mirrors `evaluate.py::_write_mark`.
 
+    `'discord'` is a member of `cts.db.HUMAN_SOURCES`, so downstream this row is
+    a human mark in every sense: it wins dedupe against the judge's own row for
+    the same (theme, artwork), it carries `export_training.HUMAN_WEIGHT`, and it
+    counts toward the abstract P@5 in `cts eval`. The separate value only records
+    where the person was sitting.
+
     Two deliberate divergences from `_write_mark`:
 
     - **Idempotent.** `judgments` has no unique constraint, so a double-tapped 👍

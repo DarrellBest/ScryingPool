@@ -46,6 +46,25 @@ TOKEN_ENV = "SCRYING_DISCORD_TOKEN"
 API_URL_ENV = "SCRYING_API_URL"
 GUILD_ENV = "SCRYING_DISCORD_GUILD_ID"
 
+# `tree.sync()` with no guild REPLACES the application's entire global command
+# set — every global command this application has, whether or not this process
+# knows about it. Point the wrong token at this bot for one run and the other
+# application's commands are gone. So a global sync is never the fallback for a
+# missing guild id; it has to be asked for by name.
+ALLOW_GLOBAL_SYNC_ENV = "SCRYING_DISCORD_ALLOW_GLOBAL_SYNC"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+_NO_SYNC_MESSAGE = (
+    "refusing to register commands: neither %s nor %s is set. A global sync "
+    "REPLACES this application's entire global command set, so it is never done "
+    "by default — pointing the wrong token at this bot would wipe the other "
+    "application's commands. The bot is running and will answer existing "
+    "commands; to register /scry, set %s=<server id> (instant, recommended), or "
+    "set %s=1 if a global sync is genuinely what you want (up to an hour to "
+    "appear in clients)."
+)
+
 DEFAULT_API_URL = "http://127.0.0.1:8077"
 
 HEALTH_TIMEOUT = 10.0       # cheap and cached server-side; never worth waiting on
@@ -368,6 +387,27 @@ def _json_or_none(response: httpx.Response) -> dict | None:
 # ------------------------------------------------------------------------------ client
 
 
+def env_allows_global_sync(env: dict[str, str] | None = None) -> bool:
+    """Was a global sync explicitly opted into? Anything unset or odd means no."""
+    source = os.environ if env is None else env
+    return source.get(ALLOW_GLOBAL_SYNC_ENV, "").strip().lower() in _TRUTHY
+
+
+def sync_plan(guild_id: int | None, allow_global_sync: bool) -> str:
+    """Which command registration this configuration permits.
+
+    "guild"  — scoped to one server, instant, and cannot touch global commands.
+    "global" — destructive, and therefore only ever from an explicit opt-in.
+    "none"   — neither was configured; register nothing and say so loudly.
+
+    A guild id wins over the opt-in: the scoped sync is the safe one, so there is
+    no configuration where both are set and the destructive path runs.
+    """
+    if guild_id is not None:
+        return "guild"
+    return "global" if allow_global_sync else "none"
+
+
 class ScryingBot(discord.Client):
     """Default intents only. Slash commands do not need Message Content.
 
@@ -375,10 +415,11 @@ class ScryingBot(discord.Client):
     most common setup snag, and this bot deliberately does not need one.
     """
 
-    def __init__(self, guild_id: int | None = None) -> None:
+    def __init__(self, guild_id: int | None = None, allow_global_sync: bool = False) -> None:
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.guild_id = guild_id
+        self.allow_global_sync = allow_global_sync
         register_commands(self.tree)
 
     async def setup_hook(self) -> None:
@@ -386,7 +427,8 @@ class ScryingBot(discord.Client):
         # second after a restart already resolves.
         self.add_dynamic_items(FeedbackButton)
 
-        if self.guild_id is not None:
+        plan = sync_plan(self.guild_id, self.allow_global_sync)
+        if plan == "guild":
             guild = discord.Object(id=self.guild_id)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
@@ -394,13 +436,24 @@ class ScryingBot(discord.Client):
                 "synced %d guild command(s) to guild %s: %s",
                 len(synced), self.guild_id, ", ".join(c.name for c in synced),
             )
-        else:
+        elif plan == "global":
+            log.warning(
+                "%s is set: syncing GLOBALLY, which replaces this application's entire "
+                "global command set. Anything else registered globally under application "
+                "id %s is about to stop existing.",
+                ALLOW_GLOBAL_SYNC_ENV, getattr(self.user, "id", "?"),
+            )
             synced = await self.tree.sync()
             log.info(
                 "synced %d global command(s): %s — global commands can take up to an "
                 "hour to appear in clients",
                 len(synced), ", ".join(c.name for c in synced),
             )
+        else:
+            # Connect and serve, but touch nothing: an unconfigured process must
+            # not be able to destroy an application's commands.
+            log.error(_NO_SYNC_MESSAGE, GUILD_ENV, ALLOW_GLOBAL_SYNC_ENV,
+                      GUILD_ENV, ALLOW_GLOBAL_SYNC_ENV)
 
     async def on_ready(self) -> None:
         user = self.user
@@ -490,15 +543,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
+    allow_global_sync = env_allows_global_sync()
+
     # The URL is safe to print; the token is not, and is never logged anywhere.
     log.info("scrying-bot starting, API at %s", api_base())
-    if guild_id is None:
-        log.info(
-            "%s is unset — registering /scry as a global command. Set it to a "
-            "server id for instant registration instead.", GUILD_ENV,
-        )
+    plan = sync_plan(guild_id, allow_global_sync)
+    if plan == "none":
+        # Logged here as well as in setup_hook so it is visible immediately in
+        # `journalctl`, before the gateway connection is even attempted.
+        log.error(_NO_SYNC_MESSAGE, GUILD_ENV, ALLOW_GLOBAL_SYNC_ENV,
+                  GUILD_ENV, ALLOW_GLOBAL_SYNC_ENV)
 
-    client = ScryingBot(guild_id=guild_id)
+    client = ScryingBot(guild_id=guild_id, allow_global_sync=allow_global_sync)
     try:
         client.run(token, log_handler=None)
     except discord.LoginFailure:

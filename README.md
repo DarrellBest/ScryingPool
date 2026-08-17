@@ -563,9 +563,15 @@ chmod 600 ~/.config/scrying-pool/bot.env
 Never in the repo, never in a unit file, never in a shell script, never a default in Python. Outside the repo
 entirely, so a token can never ride along in a `git add -A`.
 
-`SCRYING_DISCORD_GUILD_ID` is optional and is not a secret. Set it and `/scry` is registered as a **guild** command,
-which appears in that server the instant the bot starts. Leave it unset and the command registers globally, which
-works everywhere the bot is invited but can take up to an hour to propagate to clients.
+`SCRYING_DISCORD_GUILD_ID` is not a secret, but it is effectively required. Set it and `/scry` is registered as a
+**guild** command, which appears in that server the instant the bot starts. Leave it unset and the bot connects and
+runs but **registers nothing**, logging an error saying so.
+
+That refusal is deliberate. The alternative — a global sync — does not add a command, it *replaces the
+application's entire global command set*, including commands this process has never heard of. Point the wrong
+token at this bot for one run and another application's commands are gone. So a global registration is never a
+fallback for a missing guild id; it takes an explicit `SCRYING_DISCORD_ALLOW_GLOBAL_SYNC=1`, and it still takes up
+to an hour to propagate to clients. A guild id wins over the opt-in when both are set.
 
 Invite the bot with scopes `bot` and `applications.commands` — no permissions and **no privileged intents**. Slash
 commands do not need Message Content, so the developer portal needs no special toggles; a privileged-intent

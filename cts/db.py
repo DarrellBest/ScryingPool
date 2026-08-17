@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS judgments (
   rationale       TEXT,
   prop_ids        TEXT,         -- JSON
   model           TEXT,
-  source          TEXT          -- judge | distill | human
+  source          TEXT          -- judge | distill | human | discord
 );
 
 CREATE TABLE IF NOT EXISTS preferences (
@@ -127,6 +127,27 @@ CREATE INDEX IF NOT EXISTS idx_retrievals_query_id   ON retrievals(query_id);
 CREATE INDEX IF NOT EXISTS idx_judgments_query_id    ON judgments(query_id);
 CREATE INDEX IF NOT EXISTS idx_judgments_illustration_id ON judgments(illustration_id);
 """
+
+
+# --------------------------------------------------------------------------- provenance
+
+# The `source` values on `judgments` / `preferences` that mean "a person said
+# this", as opposed to a model. `human` is an operator mark from `python -m cts
+# eval`; `discord` is a vote on a `/scry` result. They differ only in where the
+# person was sitting when they pressed the button, so every consumer — dedupe
+# priority, training weight, eval metrics — must treat them identically. Adding
+# a new human-facing surface means adding its source here and nowhere else.
+HUMAN_SOURCES = frozenset({"human", "discord"})
+
+# The same set as a SQL list literal, so a WHERE clause never hardcodes the
+# values and drifts away from the Python side. Safe to splice: the members are
+# fixed identifiers defined right above, never user input.
+HUMAN_SOURCES_SQL = "(" + ", ".join(f"'{s}'" for s in sorted(HUMAN_SOURCES)) + ")"
+
+
+def is_human_source(source: str | None) -> bool:
+    """True when this `source` value was written by a person rather than a model."""
+    return source in HUMAN_SOURCES
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
