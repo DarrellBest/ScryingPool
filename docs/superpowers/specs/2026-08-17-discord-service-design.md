@@ -277,11 +277,21 @@ than they would under a lock.
   and `retrievals`, `judge.log_judgments` writes `judgments`, `/feedback` writes too.
   Against refresh's long embed transactions, Python's default 5-second busy timeout is not
   enough, and a `database is locked` raised out of `_log_query` fails the **entire** search
-  after all the model work has already been paid for. **The serving connection and every
-  feedback connection set `PRAGMA busy_timeout=30000` immediately after `db.connect()`.**
-  This is a serving-side pragma, not a change to `cts/db.py`. It is the single most
-  important line in this section: without it, "searches during a refresh are slow" quietly
-  becomes "searches during a refresh throw".
+  after all the model work has already been paid for. **`cts/db.py::connect()` sets
+  `PRAGMA busy_timeout=30000` alongside the WAL and foreign-keys pragmas it already sets.**
+  It is the single most important line in this section: without it, "searches during a
+  refresh are slow" quietly becomes "searches during a refresh throw".
+
+  This was originally specified as a serving-side pragma applied after `db.connect()`, on
+  the principle that `cts/` stays untouched. That was wrong, and it is the one place this
+  design edits `cts/`. The bug is not serving-specific: *any* two `cts` processes that
+  write concurrently hit it — a `python -m cts search` in a terminal while the weekly
+  refresh embeds, `evaluate` against a running `ingest`. Fixing it one caller at a time
+  leaves the same landmine for every other caller and makes the correct pragma set
+  something each new connection site has to remember. It belongs where the other two
+  pragmas already live. The serving connection in `serve/api.py` opens its own
+  `sqlite3.connect` (for `check_same_thread=False`) and therefore sets all three pragmas
+  itself, mirroring `db.connect()`.
 
 ### Other accepted risks
 
@@ -690,9 +700,13 @@ README's "no cloud, no vector database, no framework" claim is about the search 
 it stays true: the framework is in the serving layer, which is optional, separate, and
 named as such.
 
-`cts/` is not modified. Not one line. Everything the API needs is already public:
-`config.load_config`, `db.connect`, `index.load_index`, `search.execute`,
-`ollama.preflight`.
+`cts/` is modified in exactly **one place**: `db.py::connect()` gains
+`PRAGMA busy_timeout=30000` next to the WAL and foreign-keys pragmas it already sets, for
+the reasons argued in *What WAL does and does not give us* above. Nothing else in `cts/`
+changes, and no `cts` behaviour changes for any existing caller beyond waiting for a lock
+instead of immediately raising `database is locked`. Everything else the API needs is
+already public: `config.load_config`, `db.connect`, `db.init_schema`, `index.load_index`,
+`search.execute`, `ollama.preflight`.
 
 `serve/install-services.sh` mirrors `install-timer.sh`'s existing style deliberately —
 derive the repo root from the script's own location, prefer `.venv/bin/python`, bake

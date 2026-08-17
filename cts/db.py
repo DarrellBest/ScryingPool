@@ -143,6 +143,14 @@ def connect(cfg: Config) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # WAL lets readers and writers coexist, but writers still serialise against
+    # each other. The pipeline's long batches (embed commits, EDHREC writes) can
+    # hold the write lock for well over sqlite3's 5-second default, and the
+    # caller that loses is not a cheap one: a search raising `database is locked`
+    # out of _log_query throws away ~80s of model work that had already been paid
+    # for. 30s is long enough to outlast any single batch commit in this repo and
+    # short enough to still fail rather than hang forever on a genuine deadlock.
+    conn.execute("PRAGMA busy_timeout=30000")
     init_schema(conn)
     return conn
 

@@ -1,4 +1,9 @@
 # Test-only dependencies. The test suite never calls Ollama and never touches the
 # network: run it with `python -m pytest` from the repository root.
 -r requirements.txt
+# The serving layer's tests need FastAPI's TestClient. They still make no network
+# calls and need no Ollama — and every one of them begins with an importorskip, so
+# a checkout that installed only requirements.txt + pytest still runs the engine
+# tests green rather than erroring during collection.
+-r serve-requirements.txt
 pytest>=8.0

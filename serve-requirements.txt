@@ -1,0 +1,12 @@
+# Dependencies of the optional serving layer (serve/), not of the search engine.
+#
+# requirements.txt stays at three packages on purpose: the README's "no cloud, no
+# vector database, no framework" claim is about cts/, and it stays true. The
+# framework lives here, in a layer that is optional, separate, and named as such.
+#
+#   pip install -r requirements.txt -r serve-requirements.txt
+-r requirements.txt
+fastapi>=0.110
+uvicorn[standard]>=0.27
+discord.py>=2.3
+httpx>=0.26
