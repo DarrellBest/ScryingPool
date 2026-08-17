@@ -1,6 +1,6 @@
 # Scrying Pool as a service — local API, Discord bot, and the weekly refresh
 
-2026-08-17. Status: approved design, pre-implementation. No code written yet.
+2026-08-17. Status: **proposed — awaiting review**. Not approved, not implemented. No code written yet.
 
 ---
 
