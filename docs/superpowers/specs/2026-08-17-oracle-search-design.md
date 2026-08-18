@@ -345,19 +345,53 @@ There is no `NOT`, no nesting and no parentheses in v1 — see *Not building*.
 | Field | Column / table | Semantics |
 | :-- | :-- | :-- |
 | `types` | `card_types(kind, value)` | matches supertype, type or subtype; UNION within |
-| `colors` | `color_identity` (default) or `colors` | see the two modes below |
+| `colors` | `color_identity` | **SUBSET** — identity ⊆ requested. Decided; see below. |
 | `mv` | `cards.cmc` | numeric, with an operator |
 | `power` / `toughness` | `power_num` / `toughness_num` | numeric; NULL for `*`/`X` — see below |
 | `legal` | `card_legalities(format, status)` | UNION within; `status = 'legal'` |
 
-**Colours have two modes and the output always says which one ran.** `identity` (default) means
-`color_identity ⊆ requested`, which is the deckbuilding reading and matches `/scry --colors`'s
-existing `color_set(c) <= wanted`. `includes` means the card's `colors` contains every requested
-letter. They differ on multicolour cards: "enchantments in green" under `identity` **excludes**
-Green-White enchantments, under `includes` it keeps them. Both readings are defensible for that
-English sentence. The default is `identity` because its failure direction is conservative — too
-few results, which is visible — rather than too many, which looks fine and is quietly wrong. The
-echo line names the mode, and the Scryfall link (below) shows the user exactly how to flip it.
+### Colours: subset of colour identity — the Commander deck-legality rule
+
+**Decided, not open.** `colors:` tests `color_identity ⊆ requested`:
+
+| Request | Matches | Does **not** match |
+| :-- | :-- | :-- |
+| `colors: G` | mono-green, and colourless | Golgari (BG), Selesnya (GW) |
+| `colors: GW` | mono-green, mono-white, Selesnya (GW), and colourless | Golgari (BG), Bant (GWU) |
+
+This is the Commander colour-identity rule stated directly: a Selesnya commander may run mono-G,
+mono-W, GW and colourless cards, and nothing else. That is what the filter computes.
+
+Multiple colours therefore need no AND/OR ruling — **there is no ambiguity to resolve for this
+field.** `colors: GW` is not "green OR white" and not "green AND white"; it is one test, "identity
+fits inside {G, W}", and adding a letter widens the *allowed* set exactly the way adding a colour to
+a commander widens what the deck may play. The UNION-within-a-field rule that governs `types` and
+`legal` simply does not apply, because there is only ever one colour constraint, not a list of them.
+
+**It matches `/scry` exactly.** `cts/search.py::post_filter` already implements
+`color_set(c.get("color_identity")) <= wanted`. Both commands compute the same thing, so `colors:`
+has **one meaning across the whole bot** and a user who learns it on one command can carry it to the
+other. That agreement is worth more than any refinement that would break it.
+
+The echo line still names the mode rather than assuming it is obvious:
+
+```
+colors ⊆ {G}  (identity fits inside)
+```
+
+The Scryfall link agrees, and this is worth checking rather than assuming: Scryfall's bare `id:g`
+is shorthand for `id<=g`, the **subset** reading — the same semantics — so the emitted link is a
+genuine cross-check and not a second, quietly different query. (Scryfall spells the opposite reading
+`id>=g`, which this design does not emit.) It gets a test.
+
+**A trade-off recorded, knowingly accepted.** In plain English, a Golgari enchantment *is* a green
+enchantment, so "show me green enchantments" will not return everything an English speaker might
+expect — Selesnya and Golgari cards are absent. This is correct for deckbuilding, which is what the
+tool is for, and it is what was chosen. It is written down here so that if it ever does become a
+problem in practice, the fix is already identified and is **not** to change this default: add a
+**second option name** (`identity:`, testing identity ⊇ requested) beside `colors:`, so both
+questions get their own word and neither is silently overloaded. Two names, never one option whose
+meaning depends on a mode flag.
 
 ### Numeric filters, and the silent-failure problem
 
@@ -423,7 +457,7 @@ or silently ignoring the word.
 **5. Every parsed filter is echoed back, in the first line of output, every time.**
 
 ```
-filters: type = enchantment · colors ⊆ {G} (identity) · mv ≤ 5 · semantic: "let me draw"
+filters: type = enchantment · colors ⊆ {G} (identity fits inside) · mv ≤ 5 · semantic: "let me draw"
 ```
 
 Not in a debug field, not behind a flag, not only when something went wrong. **First line, always,
@@ -998,7 +1032,7 @@ Content line, above the embeds:
 
 ```
 🔮 "enchantments in green that let me draw and cost 5 or less"
-filters: type = enchantment · colors ⊆ {G} (identity) · mv ≤ 5 · semantic: "let me draw"
+filters: type = enchantment · colors ⊆ {G} (identity fits inside) · mv ≤ 5 · semantic: "let me draw"
 214 cards passed the filters · 40 judged · 4 of 5 clear the 0.5 fit bar
 [refine on Scryfall](https://scryfall.com/search?q=t%3Aenchantment+id%3Ag+cmc%3C%3D5)
 ```
@@ -1045,7 +1079,7 @@ unit, no second entry in the machine inventory beyond the new database file.
 
 | Endpoint | Shape |
 | :-- | :-- |
-| `POST /oracle/search` | `{query, k, filters: {types, colors, color_mode, mv_min, mv_max, legal}}` → `execute`'s dict passed through unchanged, plus a `service` block |
+| `POST /oracle/search` | `{query, k, filters: {types, colors, mv_min, mv_max, legal}}` → `execute`'s dict passed through unchanged, plus a `service` block |
 | `POST /oracle/feedback` | mirrors `/feedback`, keyed on `oracle_id`, `source='discord'`, idempotent by delete-then-insert |
 | `GET /health` | gains an `oracle` block |
 | `POST /admin/reload` | gains `{"index": "art" \| "oracle" \| "all"}`, defaulting to `"all"` |
@@ -1122,7 +1156,7 @@ test below preserves all of that. The `data/` tree is gitignored, so no test may
 | File | Covers |
 | :-- | :-- |
 | **`tests/test_oracle_chunk.py`** | The heaviest new file, matching where the risk is. The chunker is a pure function of a card dict, so it is table-driven over real card text pasted into the module — the same convention `conftest.py`'s hand-picked `CORPUS` already uses. Cases: a vanilla creature (empty text → the whole-card chunk only); a two-ability enchantment (→ 2 + 1); a Saga; a DFC with `\n//\n`-joined faces (→ `face_index` 0 and 1); a card whose own name appears in its text (asserting `text_embedded` substitutes it and `text` does **not**); a keyword-only card (asserting reminder text is **kept**, because stripping it is the most likely well-intentioned regression); a card with `{T}:` and `+1/+1` (asserting no sentence-splitting happens); ordinals contiguous from 0. |
-| **`tests/test_oracle_filters.py`** | The second-highest-risk piece, because it fails silently. The compiler is a pure function from a filter dict to `(sql, params)`. Every English phrase in the calibration table, fed through a **stubbed router response** (never a live call), asserting the resulting operator — including the `<=` versus `<` pairs, which is where an inversion would live. UNION within a field, AND across fields. Hard filters survive an empty result; soft filters drop at zero and only at zero, broadest-first, with a note naming the dropped one. The 0–30 absurd-value guard. `power_num` NULL exclusion and the excluded-count note. The echo string, character for character. The Scryfall URL round-tripping every filter it can express. |
+| **`tests/test_oracle_filters.py`** | The second-highest-risk piece, because it fails silently. The compiler is a pure function from a filter dict to `(sql, params)`. Every English phrase in the calibration table, fed through a **stubbed router response** (never a live call), asserting the resulting operator — including the `<=` versus `<` pairs, which is where an inversion would live. UNION within a field, AND across fields. Hard filters survive an empty result; soft filters drop at zero and only at zero, broadest-first, with a note naming the dropped one. The 0–30 absurd-value guard. `power_num` NULL exclusion and the excluded-count note. The echo string, character for character, including that `colors` renders as `⊆` with its English gloss. The Scryfall URL round-tripping every filter it can express, and specifically that `colors: G` emits `id:g` (subset) and never `id>=g` — a link that disagrees with the search it came from is worse than no link. |
 | **`tests/test_oracle_render.py`** | Pure functions over canned result dicts, stdlib only, like `tests/test_render.py`. Full oracle text present verbatim in the description; the `▸` marker on the right line, derived from `ordinal`; the rationale positioned **after** the oracle text; **no `image` and no `thumbnail` key, ever** — that is a decision, so it gets a test, exactly as the "Popularity band, never Power level" string does today; the STRETCH label; the filter echo line; a 4,000-character oracle text truncating rather than 400-ing the message; an empty result set carrying the counts. |
 | **`tests/test_oracle_judge.py`** | Batch-local chunk renumbering and citation validation, mirroring `tests/test_judge_props.py`: a citation belonging to another candidate is counted misattributed and dropped; one never shown is counted invented and dropped. **Plus a prompt-content test** asserting the mechanics rubric still names draw, loot, rummage, impulse, surveil, scry, reveal and tutor. A prompt edit that quietly deletes two of those lines is invisible in review and catastrophic in output. |
 | **`tests/test_oracle_staleness.py`** | The second fingerprint, mirroring `tests/test_staleness.py`: inserting a chunk moves it, inserting an embedding moves it, changing nothing does not, `meta.last_oracle_refresh_at` moves it. A rebuild that raises leaves the old index in place and marks `stale`. One poll tick checks both fingerprints and rebuilding one does not rebuild the other. |
