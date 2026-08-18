@@ -19,6 +19,7 @@ DEFAULT_POWER_WEIGHTS: dict[str, float] = {
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_DB_PATH = "data/commanders.db"
 DEFAULT_ART_DIR = "data/art"
+DEFAULT_ORACLE_DB_PATH = "data/oracle.db"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,10 @@ class Config:
     db_path: str
     art_dir: str
     power_weights: dict
+    # The oracle corpus lives in its own file, deliberately disjoint from
+    # db_path. Defaulted so every Config built before the key existed — the
+    # tests', and any config.toml written earlier — keeps working unchanged.
+    oracle_db_path: str = DEFAULT_ORACLE_DB_PATH
 
 
 def _weights(raw: dict) -> dict[str, float]:
@@ -81,4 +86,5 @@ def load_config(path: str = "config.toml") -> Config:
         db_path=str(raw.get("db_path", DEFAULT_DB_PATH)),
         art_dir=str(raw.get("art_dir", DEFAULT_ART_DIR)),
         power_weights=_weights(raw),
+        oracle_db_path=str(raw.get("oracle_db_path", DEFAULT_ORACLE_DB_PATH)),
     )

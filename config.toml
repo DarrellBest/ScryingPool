@@ -62,6 +62,16 @@ db_path = "data/commanders.db"
 # Art crops are downloaded to <art_dir>/<illustration_id>.jpg
 art_dir = "data/art"
 
+# The oracle corpus: every paper card's rules text, one row per oracle_id, from
+# Scryfall's `oracle_cards` bulk file. Deliberately a SECOND database file rather
+# than more tables in db_path, because the two corpora are disjoint at every
+# level — different grain (oracle_id vs illustration_id), different scope
+# (~32,700 paper cards vs 3,202 commander-legal ones), different refresh costs.
+# Sharing a file would put ~16 hours of vision work at risk on every migration,
+# VACUUM and restore, to serve a corpus that rebuilds from scratch in minutes.
+# The separation is the backup strategy. Nothing ever joins or ATTACHes the two.
+oracle_db_path = "data/oracle.db"
+
 # --- Power score weights (Phase 3) --------------------------------------
 # The composite power score blends four components, each normalized across the
 # corpus and stored separately in power.components so weights can be retuned

@@ -42,7 +42,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from cts import db, ollama as ollama_mod, search as search_mod
+from cts import db, ollama as ollama_mod, oracle_db, oracle_names, search as search_mod
 from cts.config import Config, load_config
 from cts.index import SearchIndex, load_index
 
@@ -68,6 +68,17 @@ FINGERPRINT_SQL = (
     "SELECT (SELECT value        FROM meta       WHERE key = 'last_refresh_at'), "
     "       (SELECT MAX(id)      FROM props), "
     "       (SELECT MAX(prop_id) FROM embeddings)"
+)
+
+# The oracle corpus's own fingerprint over its own database file, with the same
+# three-field rationale: a "something happened" marker for runs that changed data
+# the index cannot see, MAX(id) as a single seek to the end of an INTEGER PRIMARY
+# KEY (never COUNT(*), which scans), and MAX(chunk_id) to catch embed lagging
+# behind chunk. Same blind spots, same escape hatch (POST /admin/reload).
+ORACLE_FINGERPRINT_SQL = (
+    "SELECT (SELECT value         FROM meta             WHERE key = 'last_oracle_refresh_at'), "
+    "       (SELECT MAX(id)       FROM chunks), "
+    "       (SELECT MAX(chunk_id) FROM chunk_embeddings)"
 )
 
 Fingerprint = tuple[Any, Any, Any]
@@ -149,6 +160,85 @@ def corpus_fingerprint(conn: sqlite3.Connection) -> Fingerprint:
     """
     row = conn.execute(FINGERPRINT_SQL).fetchone()
     return (row[0], row[1], row[2])
+
+
+def oracle_fingerprint(conn: sqlite3.Connection) -> Fingerprint:
+    """The oracle corpus's three seeks. Read on the same 60s tick as the art one.
+
+    One poller checks both fingerprints: a second background task would be a
+    second thing to reason about for a check that costs three index seeks.
+    """
+    row = conn.execute(ORACLE_FINGERPRINT_SQL).fetchone()
+    return (row[0], row[1], row[2])
+
+
+def open_oracle_connection(cfg: Config) -> sqlite3.Connection:
+    """The resident handle on `oracle_db_path`, used only by `GET /card`.
+
+    `check_same_thread=False` for a narrower reason than the art connection's:
+    this one is *created* on the startup worker thread (`build_engine` runs under
+    `asyncio.to_thread`) and thereafter **used only from the event loop**. The
+    stdlib guard would reject that first cross-thread use even though nothing
+    concurrent ever happens.
+
+    The invariant that makes it safe is that nothing else touches this handle at
+    all: name resolution runs on the event loop, the fingerprint check runs
+    inline on the event loop (three index seeks — cheaper than the thread hop),
+    and the index rebuild — the one genuinely slow thing — is given its **own**
+    throwaway connection in `build_name_index`. Two objects that never meet is a
+    shorter thing to be confident about than a lock over one that does.
+    """
+    path = Path(cfg.oracle_db_path)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    oracle_db.init_schema(conn)
+    return conn
+
+
+def build_name_index(cfg: Config) -> oracle_names.NameIndex:
+    """Build the `/search` resolver's structures on a connection of its own.
+
+    Runs on a worker thread, so it must not touch the connection `GET /card` is
+    reading from on the event loop. Read-only: a rebuild is never a reason to
+    write to the corpus.
+    """
+    conn = sqlite3.connect(f"file:{Path(cfg.oracle_db_path)}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return oracle_names.build_index(conn)
+    finally:
+        conn.close()
+
+
+def read_oracle_stats(cfg: Config) -> dict:
+    """Card count and last oracle refresh stamp, on a throwaway read-only handle.
+
+    Read-only and per call for the same reason `read_corpus_stats` is: the bot
+    polls `/health` before every search and `oracle_db.connect()` would run
+    `init_schema`, i.e. a write transaction, on each one.
+    """
+    stats: dict = {"cards": None, "chunks": None, "last_oracle_refresh_at": None}
+    try:
+        conn = sqlite3.connect(f"file:{Path(cfg.oracle_db_path)}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return stats
+    try:
+        stats["cards"] = conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+        stats["chunks"] = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_oracle_refresh_at'"
+        ).fetchone()
+        stats["last_oracle_refresh_at"] = row[0] if row else None
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return stats
 
 
 def open_serving_connection(cfg: Config) -> sqlite3.Connection:
@@ -369,6 +459,16 @@ class Busy(Exception):
         self.max_queued = max_queued
 
 
+class OracleCorpusUnavailable(Exception):
+    """`GET /card` was asked something the oracle corpus cannot answer yet.
+
+    Distinct from "no such card" on purpose: an empty corpus and a misspelled
+    name are different problems with different fixes, and collapsing them would
+    tell a user to check their spelling when the real answer is that nobody has
+    run `python -m cts oracle-ingest` on the host.
+    """
+
+
 class Engine:
     """Everything the process holds between requests, and the lock over it.
 
@@ -390,6 +490,11 @@ class Engine:
         refresh_probe: Callable[[], bool | None] | None = None,
         ollama_probe: Callable[[], dict] | None = None,
         corpus_stats: Callable[[], dict] | None = None,
+        oracle_conn: sqlite3.Connection | None = None,
+        name_index: Any = None,
+        oracle_fingerprint_value: Fingerprint | None = None,
+        oracle_index_builder: Callable[[Config], Any] | None = None,
+        oracle_stats: Callable[[], dict] | None = None,
         max_queued: int = MAX_QUEUED,
         poll_seconds: float = POLL_SECONDS,
         poll_debounce_seconds: float = POLL_DEBOUNCE_SECONDS,
@@ -407,6 +512,25 @@ class Engine:
         self.ollama = _Cached(ollama_probe or (lambda: probe_ollama(cfg)))
         self.corpus = _Cached(corpus_stats or (lambda: read_corpus_stats(cfg)))
 
+        # --- the oracle corpus, in its own file, on its own fingerprint --------
+        # All optional: an engine constructed without them (every existing test)
+        # serves /scry exactly as before and answers /card with an honest 503.
+        self.oracle_conn = oracle_conn
+        self.name_index = name_index
+        self.oracle_index_fingerprint = oracle_fingerprint_value
+        self.oracle_index_builder = oracle_index_builder or build_name_index
+        self.oracle = _Cached(oracle_stats or (lambda: read_oracle_stats(cfg)))
+        self.oracle_built_at = _utcnow()
+        self.oracle_stale = False
+        # Guards the name-index rebuild only. It is NOT a second search queue:
+        # /card takes no lock at all on its fast path, because a name lookup
+        # queued behind an 80-second /scry would be absurd and the shared search
+        # lock exists solely to serialise contention for one Ollama instance that
+        # /search never touches.
+        self.oracle_rebuild_lock = asyncio.Lock()
+        self.lookups_since_start = 0
+        self._oracle_stats_cache: dict = {}
+
         self.max_queued = max_queued
         self.poll_seconds = poll_seconds
         self.poll_debounce_seconds = poll_debounce_seconds
@@ -418,6 +542,7 @@ class Engine:
         self.searches_since_start = 0
         self.last_search_seconds: float | None = None
         self.last_poll_rebuild = 0.0
+        self.last_oracle_poll_rebuild = 0.0
 
     # ---------------------------------------------------------------- index freshness
 
@@ -462,12 +587,131 @@ class Engine:
         self.index_stale = False
         return True
 
+    # ------------------------------------------------------------- oracle freshness
+
+    async def ensure_oracle_current(self, *, force: bool = False) -> bool:
+        """Rebuild the name index if the oracle fingerprint moved. Returns whether it did.
+
+        Takes `oracle_rebuild_lock`, never the search lock: this must stay
+        answerable while an 80-second `/scry` holds the GPU. The builder opens its
+        own connection, so nothing here touches `self.oracle_conn`, and the new
+        index is fully built before the attribute is rebound — a concurrent
+        `/card` therefore sees either the old index or the new one, never a
+        half-built one.
+
+        A failed rebuild keeps the old index and marks it stale, for the same
+        reason the art one does: serving last week's names is bad, serving nothing
+        is worse, and the next miss tries again.
+        """
+        if self.oracle_conn is None:
+            return False
+        async with self.oracle_rebuild_lock:
+            try:
+                # Inline, not on a worker thread: three index seeks against a
+                # connection whose whole safety argument is that only the event
+                # loop touches it.
+                fingerprint = oracle_fingerprint(self.oracle_conn)
+            except sqlite3.Error:
+                traceback.print_exc()
+                self.oracle_stale = True
+                return False
+
+            if not force and fingerprint == self.oracle_index_fingerprint:
+                return False
+
+            try:
+                index = await asyncio.to_thread(self.oracle_index_builder, self.cfg)
+            except Exception:                    # noqa: BLE001 - keep serving
+                traceback.print_exc()
+                self.oracle_stale = True
+                return False
+
+            self.name_index = index
+            self.oracle_index_fingerprint = fingerprint
+            self.oracle_built_at = _utcnow()
+            self.oracle_stale = False
+            return True
+
+    def oracle_refreshed_at(self) -> str | None:
+        """`meta.last_oracle_refresh_at`, for the "prices as of" label.
+
+        One indexed row off the resident connection, on the event loop: cheaper
+        than the cached probe's thread hop, and it is read once per lookup.
+        """
+        if self.oracle_conn is None:
+            return None
+        try:
+            row = self.oracle_conn.execute(
+                "SELECT value FROM meta WHERE key = 'last_oracle_refresh_at'"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return row[0] if row else None
+
+    async def resolve_card(self, name: str) -> dict:
+        """`GET /card`. No lock, no queue, no `to_thread`, no model call.
+
+        Fast enough to run on the event loop — dict lookups over resident
+        structures plus one indexed SQLite row — which is the whole reason
+        `/search` is the one command that does not `defer()`.
+
+        The one place staleness is paid for is **failure**: a name that resolves
+        to nothing might be a card from Sunday's set release, so the fingerprint
+        is checked and the index rebuilt once before "no such card" is reported.
+        Doing that on the success path would trade the property that makes this
+        command pleasant for nothing.
+        """
+        self.lookups_since_start += 1
+        if self.oracle_conn is None or self.name_index is None:
+            raise OracleCorpusUnavailable("the oracle corpus is not configured")
+
+        resolution = oracle_names.resolve(self.name_index, name)
+        if resolution.layer is None:
+            rebuilt = await self.ensure_oracle_current()
+            if rebuilt:
+                resolution = oracle_names.resolve(self.name_index, name)
+
+        if len(self.name_index) == 0:
+            raise OracleCorpusUnavailable(
+                "the oracle corpus is empty — run 'python -m cts oracle-ingest'"
+            )
+
+        body: dict = {
+            "resolved": resolution.resolved,
+            "layer": resolution.layer,
+            "input": resolution.query,
+            "distance": resolution.distance,
+            "total": resolution.total,
+            "card": None,
+            "candidates": [],
+        }
+        if resolution.resolved and resolution.oracle_id:
+            body["card"] = oracle_names.card_payload(self.oracle_conn, resolution.oracle_id)
+        elif resolution.oracle_ids:
+            body["candidates"] = oracle_names.candidate_briefs(
+                self.oracle_conn, resolution.oracle_ids
+            )
+        return body
+
     async def poll_once(self) -> str:
         """One background staleness tick. Returns what it decided, for the tests.
 
         Latency hiding, not the guarantee: the per-search check in `search()` is
         never skipped, so correctness does not depend on this ever running.
+
+        **One poller, two fingerprints.** The oracle half is checked first and
+        outside the search lock, because the name index is rebuilt on its own
+        connection and genuinely does not contend with a search in flight —
+        skipping it for 80 seconds because a `/scry` is running would delay the
+        one index whose rebuild costs a fraction of a second. It keeps the other
+        two guards: suppressed while `cts-refresh.service` is active, and its own
+        five-minute debounce.
         """
+        if self.oracle_conn is not None and await self.refresh.get() is not True:
+            if time.monotonic() - self.last_oracle_poll_rebuild >= self.poll_debounce_seconds:
+                if await self.ensure_oracle_current():
+                    self.last_oracle_poll_rebuild = time.monotonic()
+
         if self.lock.locked():
             # A search holds it. Do not queue behind ~80s of GPU work; try again
             # in a minute.
@@ -573,10 +817,35 @@ class Engine:
 
     # ------------------------------------------------------------------------- health
 
+    def _oracle_health(self, now: datetime) -> dict | None:
+        """The `oracle` block, or None when this process has no oracle corpus.
+
+        Reported separately from `index` because "the art index is stale" and
+        "the oracle index is stale" are different problems with different causes,
+        and one number covering both would name neither.
+        """
+        if self.oracle_conn is None or self.name_index is None:
+            return None
+        stats = self._oracle_stats_cache or {}
+        return {
+            "cards": getattr(self.name_index, "card_count", 0),
+            "names": getattr(self.name_index, "name_count", 0),
+            "chunks": stats.get("chunks"),
+            "build_seconds": round(getattr(self.name_index, "build_seconds", 0.0), 3),
+            "built_at": _iso(self.oracle_built_at),
+            "age_seconds": round((now - self.oracle_built_at).total_seconds(), 1),
+            "stale": self.oracle_stale,
+            "last_oracle_refresh_at": stats.get("last_oracle_refresh_at"),
+            "lookups_since_start": self.lookups_since_start,
+        }
+
     async def health(self) -> dict:
         ollama = await self.ollama.get()
         refresh_running = await self.refresh.get()
         corpus = await self.corpus.get()
+        self._oracle_stats_cache = (
+            await self.oracle.get() if self.oracle_conn is not None else {}
+        )
 
         degraded = not ollama.get("reachable") or bool(ollama.get("missing_models"))
         if degraded:
@@ -587,7 +856,8 @@ class Engine:
             status = "ok"
 
         now = _utcnow()
-        return {
+        oracle_block = self._oracle_health(now)
+        body = {
             "status": status,
             "uptime_seconds": round((now - self.started_at).total_seconds(), 1),
             "index": {
@@ -620,6 +890,9 @@ class Engine:
                 "searches_since_start": self.searches_since_start,
             },
         }
+        if oracle_block is not None:
+            body["oracle"] = oracle_block
+        return body
 
 
 def _degraded(outcome: dict) -> bool:
@@ -675,12 +948,25 @@ class FeedbackRequest(BaseModel):
 
 
 def build_engine(config_path: str = "config.toml") -> Engine:
-    """Startup: config, connection, index. ~4-7s, paid once per process."""
+    """Startup: config, both connections, both indexes. ~4-7s, paid once per process."""
     cfg = load_config(config_path)
     conn = open_serving_connection(cfg)
     fingerprint = corpus_fingerprint(conn)
     index = load_index(cfg, conn)
-    return Engine(cfg, conn, index, fingerprint)
+
+    # The oracle corpus is optional at startup: a checkout that has not run
+    # `python -m cts oracle-ingest` still serves /scry, and /card says exactly
+    # what is missing rather than 500ing.
+    oracle_conn = open_oracle_connection(cfg)
+    return Engine(
+        cfg,
+        conn,
+        index,
+        fingerprint,
+        oracle_conn=oracle_conn,
+        name_index=build_name_index(cfg),
+        oracle_fingerprint_value=oracle_fingerprint(oracle_conn),
+    )
 
 
 def create_app(engine: Engine | None = None, *, config_path: str = "config.toml") -> FastAPI:
@@ -704,6 +990,8 @@ def create_app(engine: Engine | None = None, *, config_path: str = "config.toml"
                     pass
             if own:
                 app.state.engine.conn.close()
+                if app.state.engine.oracle_conn is not None:
+                    app.state.engine.oracle_conn.close()
 
     app = FastAPI(
         title="Scrying Pool",
@@ -763,27 +1051,97 @@ def create_app(engine: Engine | None = None, *, config_path: str = "config.toml"
             )
         return JSONResponse(content={"ok": True, "replaced": result["replaced"]})
 
+    @app.get("/card")
+    async def card(name: str = "") -> JSONResponse:
+        """Resolve one card name against the local oracle corpus.
+
+        `GET /card`, not `POST /search` — `/search` is already the art search in
+        this app, and reusing the path would be a genuine collision. The Discord
+        command name and the HTTP route deliberately differ.
+
+        Ambiguity is a **200 with `resolved: false` and a populated `candidates`
+        array**, not a 404: the query was well-formed and the answer is "several".
+        A genuine miss is `resolved: false` with `candidates: []`. `layer` is on
+        every response, which is what makes the resolver debuggable from `curl`
+        without reading logs.
+        """
+        engine_: Engine = app.state.engine
+        typed = (name or "").strip()
+        if not typed:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "detail": "name must not be blank"},
+            )
+
+        started = time.monotonic()
+        try:
+            body = await engine_.resolve_card(typed)
+        except OracleCorpusUnavailable as exc:
+            return JSONResponse(
+                status_code=503, content={"status": "unavailable", "detail": str(exc)}
+            )
+        except Exception as exc:                 # noqa: BLE001 - the bot needs a body
+            traceback.print_exc()
+            return JSONResponse(
+                status_code=500, content={"status": "error", "detail": str(exc)}
+            )
+
+        body["service"] = {
+            "oracle_index_built_at": _iso(engine_.oracle_built_at),
+            "oracle_index_stale": engine_.oracle_stale,
+            "refreshed_at": engine_.oracle_refreshed_at(),
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+        return JSONResponse(content=json.loads(json.dumps(body, default=str)))
+
     @app.get("/health")
     async def health() -> JSONResponse:
         return JSONResponse(content=await app.state.engine.health())
 
     @app.post("/admin/reload")
-    async def reload() -> JSONResponse:
-        """Force a rebuild, for the blind spots the fingerprint cannot see."""
+    async def reload(index: str = "all") -> JSONResponse:
+        """Force a rebuild, for the blind spots the fingerprints cannot see.
+
+        `?index=art|oracle|all`, defaulting to `all`. Naming one rebuilds only
+        that one — an oracle-only reload must not pay the art index's 4-7 seconds,
+        and an art-only reload must not drop a name index that is fine.
+        """
         engine_: Engine = app.state.engine
-        async with engine_.lock:
-            rebuilt = await engine_.ensure_current(force=True)
-        return JSONResponse(
-            content={
-                "ok": rebuilt,
-                "index_rebuilt": rebuilt,
-                "index_built_at": _iso(engine_.index_built_at),
-                "props": len(engine_.index),
-                "artworks": engine_.index.artwork_count,
-                "missing_embeddings": engine_.index.missing_embeddings,
-                "stale": engine_.index_stale,
-            }
-        )
+        wanted = (index or "all").strip().lower()
+        if wanted not in ("art", "oracle", "all"):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "error",
+                    "detail": f"index must be one of art, oracle, all; got {index!r}",
+                },
+            )
+
+        rebuilt = False
+        if wanted in ("art", "all"):
+            async with engine_.lock:
+                rebuilt = await engine_.ensure_current(force=True)
+
+        oracle_rebuilt = False
+        if wanted in ("oracle", "all") and engine_.oracle_conn is not None:
+            oracle_rebuilt = await engine_.ensure_oracle_current(force=True)
+
+        body = {
+            "ok": rebuilt or oracle_rebuilt,
+            "index": wanted,
+            "index_rebuilt": rebuilt,
+            "index_built_at": _iso(engine_.index_built_at),
+            "props": len(engine_.index),
+            "artworks": engine_.index.artwork_count,
+            "missing_embeddings": engine_.index.missing_embeddings,
+            "stale": engine_.index_stale,
+            "oracle_index_rebuilt": oracle_rebuilt,
+        }
+        if engine_.name_index is not None:
+            body["oracle_index_built_at"] = _iso(engine_.oracle_built_at)
+            body["cards"] = getattr(engine_.name_index, "card_count", 0)
+            body["oracle_stale"] = engine_.oracle_stale
+        return JSONResponse(content=body)
 
     return app
 

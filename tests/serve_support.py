@@ -15,8 +15,77 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from cts import db
+from cts import db, oracle_db, oracle_names
 from cts.config import Config
+
+# Real names, chosen for the resolution layers they exercise: an exact hit, a
+# face name, a prefix cluster, and a pair one edit apart.
+ORACLE_CARDS: tuple[tuple[str, str, int | None, tuple[str, ...]], ...] = (
+    ("o-sol", "Sol Ring", 1, ()),
+    ("o-cradle", "Gaea's Cradle", 449, ()),
+    ("o-borrower", "Brazen Borrower // Petty Theft", 300, ("Brazen Borrower", "Petty Theft")),
+    ("o-path-exile", "Path to Exile", 250, ()),
+    ("o-path-ancestry", "Path of Ancestry", 100, ()),
+    ("o-recall", "Ancestral Recall", 20000, ()),
+    ("o-vision", "Ancestral Vision", 6000, ()),
+)
+
+
+def memory_oracle_conn() -> sqlite3.Connection:
+    """An in-memory oracle corpus holding ORACLE_CARDS, wired like the real one."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    oracle_db.init_schema(conn)
+    for oracle_id, name, rank, faces in ORACLE_CARDS:
+        conn.execute(
+            "INSERT INTO cards(oracle_id, name, name_norm, type_line, oracle_text, "
+            "mana_cost, cmc, color_identity, layout, edhrec_rank, set_code, rarity, "
+            "image_normal, price_usd, scryfall_uri, related_edhrec) VALUES "
+            "(?, ?, ?, 'Artifact', '{T}: Add {C}{C}.', '{1}', 1.0, '', 'normal', ?, "
+            "'msc', 'uncommon', ?, 1.6, ?, ?)",
+            (
+                oracle_id,
+                name,
+                oracle_names.fold(name),
+                rank,
+                f"https://cards.scryfall.io/normal/{oracle_id}.jpg",
+                f"https://scryfall.com/card/{oracle_id}",
+                f"https://edhrec.com/route/?cc={name.replace(' ', '+')}",
+            ),
+        )
+        for face_index, face_name in enumerate(faces):
+            conn.execute(
+                "INSERT INTO card_faces(oracle_id, face_index, name, name_norm) "
+                "VALUES (?, ?, ?, ?)",
+                (oracle_id, face_index, face_name, oracle_names.fold(face_name)),
+            )
+        conn.execute(
+            "INSERT INTO card_legalities(oracle_id, format, status) "
+            "VALUES (?, 'commander', 'legal')",
+            (oracle_id,),
+        )
+    oracle_db.meta_set(conn, oracle_db.LAST_REFRESH_KEY, "2026-08-17T03:43:02+00:00")
+    conn.commit()
+    return conn
+
+
+@dataclass
+class StubOracleBuilder:
+    """Stands in for `serve.api.build_name_index`. Counts builds; can be made to fail.
+
+    Takes only a Config, because the real builder opens its own read-only
+    connection rather than sharing the one `GET /card` reads from.
+    """
+
+    conn: sqlite3.Connection | None = None
+    calls: int = 0
+    raises: BaseException | None = None
+
+    def __call__(self, cfg) -> oracle_names.NameIndex:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return oracle_names.build_index(self.conn or memory_oracle_conn())
 
 
 def memory_conn() -> sqlite3.Connection:

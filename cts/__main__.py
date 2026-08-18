@@ -50,6 +50,12 @@ def _search(cfg: Config, args: argparse.Namespace) -> None:
     )
 
 
+def _oracle_ingest(cfg: Config, args: argparse.Namespace) -> None:
+    from .oracle_ingest import run as run_oracle_ingest
+
+    run_oracle_ingest(cfg, force=args.force)
+
+
 def _refresh(cfg: Config, args: argparse.Namespace) -> None:
     from .refresh import run as run_refresh
 
@@ -147,6 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit the full pool as JSON, including all links",
     )
     p.set_defaults(handler=_search)
+
+    p = sub.add_parser(
+        "oracle-ingest",
+        help="oracle corpus: Scryfall oracle_cards bulk -> cards/faces/types/legalities",
+        description="Build the oracle corpus in its own database (oracle_db_path), one "
+        "row per Oracle ID for every paper card. Never touches the art corpus. "
+        "Idempotent: skips the download when Scryfall's bulk file has not moved.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download and re-parse even when the bulk file has not changed",
+    )
+    p.set_defaults(handler=_oracle_ingest)
 
     p = sub.add_parser(
         "refresh",

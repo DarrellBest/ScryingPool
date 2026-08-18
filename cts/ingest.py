@@ -74,29 +74,41 @@ def data_dir(cfg: Config) -> Path:
 # --------------------------------------------------------------------------
 
 
-def bulk_entry() -> dict:
-    """The `default_cards` entry from Scryfall's bulk-data index."""
+def bulk_entry(bulk_type: str = BULK_TYPE) -> dict:
+    """One entry from Scryfall's bulk-data index, `default_cards` by default.
+
+    The parameter exists for `cts/oracle_ingest.py`, which wants the
+    `oracle_cards` file — one object per Oracle ID, a third of the size, and
+    exactly the grain that corpus searches. Defaulting to the existing constant
+    means no existing caller changes behaviour.
+    """
     resp = requests.get(
         BULK_DATA_URL, timeout=_TIMEOUT, headers={"User-Agent": USER_AGENT}
     )
     resp.raise_for_status()
     for entry in resp.json().get("data", []):
-        if entry.get("type") == BULK_TYPE:
+        if entry.get("type") == bulk_type:
             return entry
-    raise RuntimeError(f"no {BULK_TYPE!r} entry in {BULK_DATA_URL}")
+    raise RuntimeError(f"no {bulk_type!r} entry in {BULK_DATA_URL}")
 
 
-def _pick_source(entry: dict, dest_dir: Path) -> tuple[str, Path]:
-    """(download url, local path). See the module docstring for why both exist."""
+def _pick_source(
+    entry: dict, dest_dir: Path, bulk_type: str = BULK_TYPE
+) -> tuple[str, Path]:
+    """(download url, local path). See the module docstring for why both exist.
+
+    The filename follows `bulk_type`, so the two corpora's bulk files sit side by
+    side in `data/bulk/` and neither can overwrite the other.
+    """
     url = entry.get("download_uri")
     if url:
-        return url, dest_dir / "default_cards.json"
+        return url, dest_dir / f"{bulk_type}.json"
     url = entry.get("jsonl_download_uri")
     if url:
         suffix = ".jsonl.gz" if url.endswith(".gz") else ".jsonl"
-        return url, dest_dir / f"default_cards{suffix}"
+        return url, dest_dir / f"{bulk_type}{suffix}"
     raise RuntimeError(
-        f"{BULK_TYPE} entry exposes no download URL; keys were {sorted(entry)}"
+        f"{bulk_type} entry exposes no download URL; keys were {sorted(entry)}"
     )
 
 

@@ -387,3 +387,329 @@ def test_admin_reload_reports_a_failed_rebuild_without_dropping_the_index(conn):
     assert body["index_rebuilt"] is False
     assert body["stale"] is True
     assert engine.index is not None
+
+
+# ------------------------------------------------------------------------ GET /card
+#
+# The name-lookup surface. It shares the app, the process and the port with the
+# art search and shares nothing else: no lock, no queue slot, no model call, no
+# worker thread. These tests assert that separation as much as the shapes.
+
+
+@pytest.fixture
+def oracle_conn():
+    connection = support.memory_oracle_conn()
+    yield connection
+    connection.close()
+
+
+def make_oracle_engine(conn, oracle_conn, *, oracle_builder=None, **kwargs) -> Engine:
+    from cts import oracle_names
+    from serve.api import oracle_fingerprint
+
+    engine = make_engine(conn, **kwargs)
+    engine.oracle_conn = oracle_conn
+    engine.name_index = oracle_names.build_index(oracle_conn)
+    engine.oracle_index_fingerprint = oracle_fingerprint(oracle_conn)
+    engine.oracle_index_builder = oracle_builder or support.StubOracleBuilder(conn=oracle_conn)
+    engine.oracle = type(engine.oracle)(
+        lambda: {"cards": 7, "chunks": 0,
+                 "last_oracle_refresh_at": "2026-08-17T03:43:02+00:00"}
+    )
+    return engine
+
+
+@pytest.fixture
+def card_client(conn, oracle_conn, searcher):
+    engine = make_oracle_engine(conn, oracle_conn, search_fn=searcher)
+    with TestClient(create_app(engine)) as test_client:
+        test_client.engine = engine
+        yield test_client
+
+
+def test_card_resolves_an_exact_name_and_reports_the_layer(card_client):
+    body = card_client.get("/card", params={"name": "Sol Ring"}).json()
+    assert body["resolved"] is True
+    assert body["layer"] == "L0"
+    assert body["input"] == "Sol Ring"
+    assert body["card"]["name"] == "Sol Ring"
+    assert body["card"]["oracle_text"] == "{T}: Add {C}{C}."
+    assert body["candidates"] == []
+
+
+def test_card_reports_the_layer_that_fired_so_curl_can_debug_the_resolver(card_client):
+    for name, layer in (
+        ("Sol Ring", "L0"),
+        ("gaeas cradle", "L1"),
+        ("Petty Theft", "L2"),
+        ("ancestral rec", "L3"),
+        ("recall ancestral", "L4"),
+        ("ancestrl recall", "L5"),
+    ):
+        body = card_client.get("/card", params={"name": name}).json()
+        assert body["layer"] == layer, (name, body["layer"])
+
+
+def test_card_carries_faces_legalities_and_links(card_client):
+    body = card_client.get("/card", params={"name": "Brazen Borrower // Petty Theft"}).json()
+    card = body["card"]
+    assert [face["name"] for face in card["faces"]] == ["Brazen Borrower", "Petty Theft"]
+    assert card["legalities"] == {"commander": "legal"}
+    assert card["links"]["scryfall"].startswith("https://scryfall.com/")
+    assert card["links"]["edhrec"].startswith("https://edhrec.com/")
+    # No TCGplayer URL was stored for this fixture, so there is no key for it.
+    assert "tcgplayer" not in card["links"]
+
+
+def test_card_returns_200_with_candidates_for_an_ambiguous_name(card_client):
+    """The query was well-formed and the answer is "several" — that is a 200 with
+    `resolved: false`, not a 404. A 404 would say the request was wrong."""
+    response = card_client.get("/card", params={"name": "path"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resolved"] is False
+    assert body["total"] == 2
+    assert [c["name"] for c in body["candidates"]] == ["Path of Ancestry", "Path to Exile"]
+    assert body["card"] is None
+
+
+def test_card_returns_200_with_no_candidates_for_a_genuine_miss(card_client):
+    response = card_client.get("/card", params={"name": "qwertyuiop asdfghjkl"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resolved"] is False
+    assert body["candidates"] == []
+    assert body["layer"] is None
+
+
+def test_card_never_corrects_an_exact_name_into_a_more_popular_neighbour(card_client):
+    """The property the whole ladder exists for, asserted through the HTTP surface
+    as well as the resolver: Ancestral Vision is three times more played and two
+    edits away, and Recall still resolves to Recall."""
+    body = card_client.get("/card", params={"name": "Ancestral Recall"}).json()
+    assert body["layer"] == "L0"
+    assert body["card"]["name"] == "Ancestral Recall"
+
+
+def test_card_rejects_a_blank_name_with_a_422(card_client):
+    assert card_client.get("/card", params={"name": "   "}).status_code == 422
+    assert card_client.get("/card").status_code == 422
+
+
+def test_card_reports_how_it_was_resolved_and_when_the_corpus_was_refreshed(card_client):
+    service = card_client.get("/card", params={"name": "Sol Ring"}).json()["service"]
+    assert service["refreshed_at"] == "2026-08-17T03:43:02+00:00"
+    assert service["oracle_index_stale"] is False
+    assert service["elapsed_ms"] >= 0
+
+
+def test_card_answers_while_a_search_holds_the_lock(conn, oracle_conn):
+    """`/search` takes no search lock and no queue slot: it makes zero model calls
+    and contends for nothing a `/scry` is using. A name lookup queued behind an
+    80-second art search would be absurd."""
+    searcher = support.StubSearch(delay=0.4)
+    engine = make_oracle_engine(conn, oracle_conn, search_fn=searcher)
+    with TestClient(create_app(engine)) as client:
+        started = threading.Event()
+        done = threading.Event()
+
+        def run_search():
+            client.post("/search", json={"theme": "lonely"})
+            done.set()
+
+        worker = threading.Thread(target=run_search)
+        worker.start()
+        assert searcher.started.wait(5)
+        started.set()
+
+        # The search is in flight and holding the lock right now.
+        begin = time.monotonic()
+        response = client.get("/card", params={"name": "Sol Ring"})
+        elapsed = time.monotonic() - begin
+
+        worker.join(10)
+        assert done.is_set()
+
+    assert response.status_code == 200
+    assert response.json()["card"]["name"] == "Sol Ring"
+    assert elapsed < 0.3, f"the lookup waited {elapsed:.3f}s — it queued behind the search"
+
+
+def test_card_does_not_count_against_the_search_queue_cap(conn, oracle_conn):
+    engine = make_oracle_engine(conn, oracle_conn)
+    with TestClient(create_app(engine)) as client:
+        for _ in range(10):
+            assert client.get("/card", params={"name": "Sol Ring"}).status_code == 200
+        assert engine.queued == 0
+        assert engine.in_flight == 0
+        assert client.get("/health").json()["search"]["searches_since_start"] == 0
+
+
+def test_card_rebuilds_the_index_once_on_a_miss_and_never_on_a_hit(conn, oracle_conn):
+    """Staleness is paid for only where it could be the cause. A name that
+    resolves to nothing might be a card from Sunday's set release; a name that
+    resolved is not, and blocking that path for a rebuild would destroy the one
+    property that makes this command pleasant."""
+    builder = support.StubOracleBuilder(conn=oracle_conn)
+    engine = make_oracle_engine(conn, oracle_conn, oracle_builder=builder)
+    with TestClient(create_app(engine)) as client:
+        client.get("/card", params={"name": "Sol Ring"})
+        assert builder.calls == 0, "a successful lookup must not rebuild anything"
+
+        client.get("/card", params={"name": "no such card at all"})
+        assert builder.calls == 0, "the fingerprint had not moved, so nothing to rebuild"
+
+        # Now something lands in the corpus that the resident index has never seen.
+        oracle_conn.execute(
+            "INSERT INTO cards(oracle_id, name, name_norm) VALUES ('o-new', 'Nadu, Winged Wisdom', "
+            "'nadu winged wisdom')"
+        )
+        oracle_conn.execute(
+            "INSERT INTO chunks(id, oracle_id, face_index, ordinal, kind, text) "
+            "VALUES (1, 'o-new', 0, 0, 'whole', 'x')"
+        )
+        oracle_conn.commit()
+
+        body = client.get("/card", params={"name": "Nadu, Winged Wisdom"}).json()
+        assert builder.calls == 1
+        assert body["resolved"] is True
+        assert body["card"]["name"] == "Nadu, Winged Wisdom"
+
+
+def test_card_survives_a_failed_rebuild_by_serving_the_index_it_has(conn, oracle_conn):
+    builder = support.StubOracleBuilder(raises=RuntimeError("disk on fire"))
+    engine = make_oracle_engine(conn, oracle_conn, oracle_builder=builder)
+    with TestClient(create_app(engine)) as client:
+        oracle_conn.execute(
+            "INSERT INTO chunks(id, oracle_id, face_index, ordinal, kind, text) "
+            "VALUES (1, 'o-sol', 0, 0, 'whole', 'x')"
+        )
+        oracle_conn.commit()
+        miss = client.get("/card", params={"name": "not a card"}).json()
+        assert miss["resolved"] is False
+        assert engine.oracle_stale is True
+        # The old index is still serving.
+        assert client.get("/card", params={"name": "Sol Ring"}).json()["resolved"] is True
+
+
+def test_card_works_when_its_connection_was_opened_on_another_thread(conn, tmp_path):
+    """`build_engine` runs under `asyncio.to_thread`, so the resident oracle
+    connection is **created on a worker thread and used from the event loop**.
+
+    A connection opened with sqlite3's default same-thread guard raises
+    ProgrammingError on the first `/card` in production while every in-process
+    test passes, because the tests construct their engines on the main thread.
+    That is exactly what happened; this is the test that would have caught it.
+    """
+    from cts import oracle_names
+    from serve.api import open_oracle_connection, oracle_fingerprint
+
+    cfg = support.config()
+    cfg = type(cfg)(**{**cfg.__dict__, "oracle_db_path": str(tmp_path / "oracle.db")})
+
+    opened: list = []
+
+    def open_it():
+        connection = open_oracle_connection(cfg)
+        connection.execute(
+            "INSERT INTO cards(oracle_id, name, name_norm) VALUES "
+            "('o-sol', 'Sol Ring', 'sol ring')"
+        )
+        connection.commit()
+        opened.append(connection)
+
+    worker = threading.Thread(target=open_it)
+    worker.start()
+    worker.join(10)
+    oracle_connection = opened[0]
+
+    try:
+        engine = make_engine(conn)
+        engine.cfg = cfg
+        engine.oracle_conn = oracle_connection
+        engine.name_index = oracle_names.build_index(oracle_connection)
+        engine.oracle_index_fingerprint = oracle_fingerprint(oracle_connection)
+        with TestClient(create_app(engine)) as client:
+            body = client.get("/card", params={"name": "Sol Ring"}).json()
+        assert body["resolved"] is True
+        assert body["card"]["name"] == "Sol Ring"
+    finally:
+        oracle_connection.close()
+
+
+def test_card_says_the_corpus_is_missing_rather_than_no_such_card(conn):
+    """An empty corpus and a misspelled name are different problems with
+    different fixes, and collapsing them would tell a user to check their
+    spelling when the real answer is that nobody ran the ingest."""
+    engine = make_engine(conn)          # no oracle corpus at all
+    with TestClient(create_app(engine)) as client:
+        response = client.get("/card", params={"name": "Sol Ring"})
+    assert response.status_code == 503
+    assert "oracle corpus" in response.json()["detail"]
+
+
+def test_health_gains_an_oracle_block_reported_separately_from_the_art_index(card_client):
+    """"The art index is stale" and "the oracle index is stale" are different
+    problems with different causes, so they are two blocks and not one number."""
+    body = card_client.get("/health").json()
+    assert body["index"]["props"] == 170_487           # unchanged
+    oracle = body["oracle"]
+    assert oracle["cards"] == len(support.ORACLE_CARDS)
+    assert oracle["names"] >= oracle["cards"]
+    assert oracle["stale"] is False
+    assert oracle["last_oracle_refresh_at"] == "2026-08-17T03:43:02+00:00"
+    assert oracle["age_seconds"] >= 0
+
+
+def test_health_has_no_oracle_block_when_this_process_has_no_oracle_corpus(client):
+    assert "oracle" not in client.get("/health").json()
+
+
+def test_admin_reload_can_name_which_index_to_rebuild(conn, oracle_conn):
+    art = support.StubBuilder()
+    oracle = support.StubOracleBuilder(conn=oracle_conn)
+    engine = make_oracle_engine(conn, oracle_conn, builder=art, oracle_builder=oracle)
+    with TestClient(create_app(engine)) as client:
+        client.post("/admin/reload", params={"index": "art"})
+        assert (art.calls, oracle.calls) == (1, 0)
+
+        client.post("/admin/reload", params={"index": "oracle"})
+        assert (art.calls, oracle.calls) == (1, 1)
+
+        body = client.post("/admin/reload", params={"index": "all"}).json()
+        assert (art.calls, oracle.calls) == (2, 2)
+        assert body["index_rebuilt"] is True
+        assert body["oracle_index_rebuilt"] is True
+
+        assert client.post("/admin/reload", params={"index": "sideways"}).status_code == 422
+
+
+def test_admin_reload_defaults_to_all(conn, oracle_conn):
+    art = support.StubBuilder()
+    oracle = support.StubOracleBuilder(conn=oracle_conn)
+    engine = make_oracle_engine(conn, oracle_conn, builder=art, oracle_builder=oracle)
+    with TestClient(create_app(engine)) as client:
+        body = client.post("/admin/reload").json()
+    assert (art.calls, oracle.calls) == (1, 1)
+    assert body["index"] == "all"
+
+
+def test_one_poll_tick_checks_both_fingerprints(conn, oracle_conn):
+    art = support.StubBuilder()
+    oracle = support.StubOracleBuilder(conn=oracle_conn)
+    engine = make_oracle_engine(conn, oracle_conn, builder=art, oracle_builder=oracle)
+
+    async def scenario():
+        assert await engine.poll_once() == "current"
+        assert (art.calls, oracle.calls) == (0, 0)
+
+        # Only the oracle fingerprint moves.
+        oracle_conn.execute(
+            "INSERT INTO chunks(id, oracle_id, face_index, ordinal, kind, text) "
+            "VALUES (1, 'o-sol', 0, 0, 'whole', 'x')"
+        )
+        oracle_conn.commit()
+        assert await engine.poll_once() == "current"     # the ART index is current
+        assert (art.calls, oracle.calls) == (0, 1)       # ...and the oracle one rebuilt
+
+    asyncio.run(scenario())

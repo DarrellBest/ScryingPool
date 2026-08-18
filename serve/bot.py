@@ -36,7 +36,7 @@ import discord
 import httpx
 from discord import app_commands
 
-from serve import render
+from serve import oracle_render, render
 
 log = logging.getLogger("scrying.bot")
 
@@ -75,6 +75,12 @@ FEEDBACK_TIMEOUT = 30.0     # its own short-lived connection, never behind the s
 # long a thrashing search is waited on.
 SEARCH_TIMEOUT = 300.0
 SEARCH_TIMEOUT_REFRESHING = 780.0
+
+# `/search` does not defer, so the ENTIRE round trip has to fit inside Discord's
+# 3-second acknowledgement window. The server side is ~20ms of dict lookups over
+# loopback; 2.5s is not a budget, it is a tripwire for "the API is wedged", and
+# it leaves room to still send a real sentence before the interaction expires.
+CARD_TIMEOUT = 2.5
 
 WUBRG = "WUBRG"
 
@@ -376,6 +382,68 @@ async def run_scry(
         )
 
 
+async def fetch_card(name: str) -> tuple[int, dict | None]:
+    """`GET /card?name=…`. Returns (status, body) and never raises.
+
+    Its own client and its own short timeout: this call must not inherit the
+    search path's 300-second patience, because a `/search` that takes longer than
+    Discord's 3-second window is a dead interaction no matter what comes back.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=CARD_TIMEOUT) as client:
+            response = await client.get(f"{api_base()}/card", params={"name": name})
+    except httpx.ConnectError:
+        return 0, None
+    except httpx.HTTPError as exc:
+        log.warning("card lookup transport error for %r: %s", name, exc)
+        return -1, None
+    return response.status_code, _json_or_none(response)
+
+
+def card_reply(name: str, status: int, body: dict | None) -> dict:
+    """Everything `/search` can say, as `{"content", "embeds"}`. Pure.
+
+    Kept out of the command body so it is testable without a gateway: the command
+    itself is then three lines and one `send_message`.
+    """
+    if status == 0:
+        return {"content": render.api_down_message(), "embeds": []}
+    if status < 0:
+        return {
+            "content": render.search_failed_message(
+                "the lookup did not complete inside its 2.5s budget"
+            ),
+            "embeds": [],
+        }
+    if status == 503:
+        return {"content": oracle_render.corpus_missing_message(), "embeds": []}
+    if status != 200 or body is None:
+        detail = (body or {}).get("detail") or f"the API answered {status}"
+        return {"content": render.search_failed_message(str(detail)), "embeds": []}
+    return oracle_render.card_message(body)
+
+
+async def run_search(interaction: discord.Interaction, name: str) -> None:
+    """One lookup, one reply, inside the 3-second window. **No `defer()`.**
+
+    `/search` makes zero LLM calls — no router, no expansion, no embedding, no
+    judge — so it touches neither Ollama nor the GPU, takes no search lock and is
+    not counted against the queue cap. A name lookup queued behind an 80-second
+    `/scry` would be absurd; the lock exists solely to serialise contention for
+    one Ollama instance that this command never uses.
+
+    The work is ~20ms, so the reply goes out with `response.send_message` and
+    there is no "thinking…" state at all. That visible difference is itself
+    useful: the fast command looks fast.
+    """
+    status, body = await fetch_card(name)
+    message = card_reply(name, status, body)
+    embeds = [discord.Embed.from_dict(e) for e in message["embeds"]]
+    await interaction.response.send_message(
+        content=message["content"] or None, embeds=embeds
+    )
+
+
 def _json_or_none(response: httpx.Response) -> dict | None:
     try:
         body = response.json()
@@ -472,11 +540,36 @@ class ScryingBot(discord.Client):
 
 
 def register_commands(tree: app_commands.CommandTree) -> None:
-    """`/scry theme:<text> [k:1-5] [band:1-5] [colors:<WUBRG>]`."""
+    """`/scry theme:<text> …` and `/search name:<text>`.
+
+    Two commands, two different questions, and Discord shows each description
+    string in the picker as the user types — so the disambiguation lands at the
+    moment of choosing. The distinguishing word is capitalised in both, because
+    that is the word that decides which one you wanted.
+    """
+
+    @tree.command(
+        name="search",
+        description="Look up one card by NAME — instant, from the local oracle corpus.",
+    )
+    @app_commands.describe(name="The card name. Spelling, case and accents are forgiving.")
+    async def search(
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 200],
+    ) -> None:
+        # Deliberately NO defer(): this answers inside the 3-second window.
+        try:
+            await run_search(interaction, name.strip())
+        except Exception as exc:                     # noqa: BLE001 - never a dead spinner
+            log.exception("unhandled error in /search")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    content=render.search_failed_message(f"{type(exc).__name__}: {exc}")
+                )
 
     @tree.command(
         name="scry",
-        description="Find commanders whose artwork matches a theme.",
+        description="Find commanders by what their ARTWORK depicts, means or evokes.",
     )
     @app_commands.describe(
         theme="What the artwork should look or feel like, in your own words.",

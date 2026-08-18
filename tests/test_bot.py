@@ -327,3 +327,187 @@ def test_setup_hook_syncs_to_the_guild_when_one_is_set():
 def test_setup_hook_syncs_globally_only_with_the_opt_in():
     tree = _hooked(None, True)
     assert tree.syncs == [None]      # None means global, and only here
+
+
+# --------------------------------------------------------------------------- /search
+#
+# The one command that does not defer. Everything about it — its own short
+# timeout, its pure reply builder, its registration — exists to keep the whole
+# round trip inside Discord's 3-second acknowledgement window.
+
+
+def _card_body(**overrides) -> dict:
+    body = {
+        "resolved": True,
+        "layer": "L1",
+        "input": "sol ring",
+        "distance": None,
+        "total": 1,
+        "card": {
+            "name": "Sol Ring",
+            "type_line": "Artifact",
+            "oracle_text": "{T}: Add {C}{C}.",
+            "mana_cost": "{1}",
+            "cmc": 1.0,
+            "set_code": "msc",
+            "rarity": "uncommon",
+            "image_normal": "https://cards.scryfall.io/normal/front/sol.jpg",
+            "price_usd": 1.6,
+            "scryfall_uri": "https://scryfall.com/card/msc/1",
+            "legalities": {"commander": "legal"},
+            "links": {"scryfall": "https://scryfall.com/card/msc/1"},
+        },
+        "candidates": [],
+        "service": {"refreshed_at": "2026-08-17T03:43:02+00:00"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_the_card_timeout_fits_inside_discords_three_second_window():
+    """`/search` never defers, so the ENTIRE round trip has to land inside 3s.
+    The timeout is a tripwire for a wedged API, not a budget to spend."""
+    assert bot.CARD_TIMEOUT < 3.0
+
+
+def test_card_reply_renders_a_card():
+    message = bot.card_reply("sol ring", 200, _card_body())
+    assert message["embeds"][0]["title"] == "Sol Ring"
+    assert message["content"] == ""
+
+
+def test_card_reply_renders_candidates_for_an_ambiguous_answer():
+    body = _card_body(
+        resolved=False, card=None, total=2, layer="L3", input="path",
+        candidates=[{"name": "Path to Exile", "mana_cost": "{W}", "type_line": "Instant"},
+                    {"name": "Path of Ancestry", "mana_cost": "", "type_line": "Land"}],
+    )
+    message = bot.card_reply("path", 200, body)
+    assert "2 cards match" in message["content"]
+    assert message["embeds"][0]["title"] == 'candidates for "path"'
+
+
+def test_card_reply_says_the_corpus_is_missing_on_a_503():
+    message = bot.card_reply("sol ring", 503, {"detail": "empty"})
+    assert "oracle-ingest" in message["content"]
+    assert message["embeds"] == []
+
+
+def test_card_reply_says_the_api_is_down_when_nothing_answered():
+    message = bot.card_reply("sol ring", 0, None)
+    assert "scrying-api" in message["content"]
+
+
+def test_card_reply_never_returns_a_dead_reply():
+    """Every branch produces a specific sentence: a spinner that never resolves is
+    the worst outcome available, and /search cannot even defer to buy time."""
+    for status, body in ((200, _card_body()), (0, None), (-1, None), (503, {}),
+                         (500, {"detail": "boom"}), (422, {"detail": "blank"}),
+                         (200, None)):
+        message = bot.card_reply("x", status, body)
+        assert message["content"] or message["embeds"], (status, body)
+
+
+# ------------------------------------------------------------------ command registration
+
+
+class _FakeResponseChannel:
+    def __init__(self):
+        self.sent = []
+        self.deferred = False
+
+    def is_done(self):
+        return bool(self.sent) or self.deferred
+
+    async def defer(self, **kwargs):
+        self.deferred = True
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+
+
+class _FakeInteraction:
+    def __init__(self):
+        self.response = _FakeResponseChannel()
+
+
+class _ClientStub:
+    """The minimum `app_commands.CommandTree` needs to be constructed.
+
+    Not a real client: nothing here connects, logs in or touches the gateway.
+    """
+
+    class _Connection:
+        """`CommandTree` writes itself onto `client._connection`, so each stub
+        needs its own rather than sharing one at class scope."""
+
+        _command_tree = None
+
+        def _remove_application_command(self, *args, **kwargs):
+            pass
+
+    def __init__(self):
+        self.application_id = 1
+        self.http = None
+        self._connection = self._Connection()
+
+
+def _build_tree():
+    from discord import app_commands
+
+    tree = app_commands.CommandTree(_ClientStub())
+    bot.register_commands(tree)
+    return tree
+
+
+def _registered(tree, name):
+    return next(command for command in tree.get_commands() if command.name == name)
+
+
+def test_both_commands_are_registered_and_named_for_the_question_they_answer():
+    """Discord shows each description in the picker as the user types, so the
+    disambiguation lands at the moment of choosing. The distinguishing word is
+    capitalised because it is the word that decides which one you wanted."""
+    tree = _build_tree()
+    names = {command.name for command in tree.get_commands()}
+    assert {"scry", "search"} <= names
+    assert "NAME" in _registered(tree, "search").description
+    assert "ARTWORK" in _registered(tree, "scry").description
+
+
+def test_search_answers_without_deferring(monkeypatch):
+    """The property that makes the fast command LOOK fast: no "thinking…" state
+    at all. Deferring here would be free to write and would cost the one visible
+    difference between this command and the 80-second one."""
+
+    async def fake_fetch(name):
+        assert name == "Sol Ring"
+        return 200, _card_body()
+
+    monkeypatch.setattr(bot, "fetch_card", fake_fetch)
+
+    command = _registered(_build_tree(), "search")
+
+    interaction = _FakeInteraction()
+    asyncio.run(command.callback(interaction, name="  Sol Ring  "))
+
+    assert interaction.response.deferred is False, "/search must not defer"
+    assert len(interaction.response.sent) == 1
+    sent = interaction.response.sent[0]
+    assert sent["embeds"][0].title == "Sol Ring"
+
+
+def test_search_still_answers_when_the_lookup_explodes(monkeypatch):
+
+    async def boom(name):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(bot, "fetch_card", boom)
+
+    interaction = _FakeInteraction()
+    asyncio.run(_registered(_build_tree(), "search").callback(interaction, name="Sol Ring"))
+
+    assert len(interaction.response.sent) == 1
+    assert "kaboom" in interaction.response.sent[0]["content"]
+
+

@@ -88,7 +88,7 @@ def run(cfg: Config) -> int:
     # Stage modules are imported here rather than at module scope so that a
     # module which is missing or fails to import reports itself as a named
     # stage failure instead of breaking `python -m cts` entirely.
-    from . import art, describe, edhrec, embed, ingest, power
+    from . import art, describe, edhrec, embed, ingest, oracle_ingest, power
 
     stages: list[tuple[str, str, object]] = [
         # 1. Bulk data. ingest.run compares the bulk-data updated_at against the
@@ -127,6 +127,27 @@ def run(cfg: Config) -> int:
         #    time, every time a search runs. At ~125k vectors that is cheap, and
         #    cheaper than maintaining incremental state between runs, so "rebuild
         #    the indexes" is satisfied by the next process that loads them.
+        #
+        # 6. The oracle corpus, in its own database file. APPENDED AT THE END, and
+        #    the position is the point: `run` returns 1 on the first stage that
+        #    raises, so newer and less-proven code placed anywhere but last would
+        #    be able to block the art pipeline that has been working. Last, it
+        #    cannot — every art stage above is committed and done before this
+        #    starts, and a failure here reports exactly which new stage broke.
+        #
+        #    Not a second timer, either: two timers writing two databases at
+        #    overlapping times would invent a contention problem that does not
+        #    need to exist and give two different answers to "when did this last
+        #    update". One unit, one journald log.
+        #
+        #    A quiet week is a 24MB download that is skipped because updated_at
+        #    has not moved. Against a run that already spends ~45 minutes polling
+        #    EDHREC at 1 req/s, this is noise.
+        ("oracle-ingest", "oracle corpus: scryfall oracle_cards bulk",
+         lambda: oracle_ingest.run(cfg)),
+        # 7-8. oracle-chunk and oracle-embed append here, after this stage, when
+        #      the semantic half of /oracle lands. /search needs neither: `cards`
+        #      and `card_faces` alone are enough to resolve a name.
     ]
 
     results: dict[str, dict] = {}
@@ -165,6 +186,10 @@ def run(cfg: Config) -> int:
     described = int(results.get("describe", {}).get("described") or 0)
     describe_failed = int(results.get("describe", {}).get("failed") or 0)
     embedded = int(results.get("embed", {}).get("embedded") or 0)
+    oracle = results.get("oracle-ingest", {})
+    oracle_cards = int(oracle.get("cards") or 0)
+    oracle_new = len(oracle.get("new_cards") or [])
+    oracle_changed = len(oracle.get("changed_text") or [])
 
     rule = "=" * 66
     print()
@@ -186,6 +211,11 @@ def run(cfg: Config) -> int:
         + (f", {describe_failed} failed" if describe_failed else "")
     )
     print(f"  embeddings         {embedded} propositions embedded")
+    print(
+        f"  oracle corpus      {oracle_cards} cards written"
+        + (f", {oracle_new} new" if oracle_new else "")
+        + (f", {oracle_changed} with changed oracle text" if oracle_changed else "")
+    )
     print("  indexes            rebuilt on next load (BM25 + matrix are built at load time)")
     print(f"  total runtime      {_fmt_duration(elapsed)}")
     print(rule)
