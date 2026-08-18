@@ -1,0 +1,54 @@
+# Wraps qwen3.8 (27.3B, capabilities: completion/vision/tools/thinking, native
+# 262,144-token context) for ScryingPool's judge_model + verify_model role: /scry
+# routing, expansion, candidate judging and per-finalist art verification, plus
+# /oracle routing, expansion and judging. See config.toml for why both keys point
+# at the same model name.
+#
+# Build:
+#   ollama create scryingpool-qwen3.8 -f models/scryingpool.Modelfile
+#
+# Rebuild after editing this file with the same command — `ollama create` is
+# idempotent and overwrites the existing tag.
+
+FROM qwen3.8
+
+# --- num_ctx ----------------------------------------------------------------
+# Not decoration. When num_ctx is unset, Ollama does not pick some sane
+# fallback — it sizes the KV cache for the MODEL'S OWN advertised context
+# window, 262,144 tokens here. That is exactly the bug already documented at
+# cts/oracle_judge.py::JUDGE_NUM_CTX: one real 2,153-token judge prompt got a
+# context allocated for 262,144 tokens and blew a 300s timeout.
+#
+# Some call sites already pin their own num_ctx per request and are
+# unaffected by this default either way: JUDGE_NUM_CTX=8192 and
+# ROUTER_NUM_CTX=4096 / EXPANSION_NUM_CTX=2048 in cts/oracle_judge.py and
+# cts/oracle_search.py. But cts/judge.py's judge_batch() and
+# verify_finalists(), and cts/search.py's route() and expand(), never set
+# num_ctx in their request options — for those calls (the /scry pipeline this
+# model now serves), this Modelfile default is the ONLY thing bounding
+# context, not a backstop.
+#
+# Sized from the real worst case, not a guess: cts/judge.py batches up to
+# BATCH_SIZE=10 candidates per judge call, each showing up to
+# MAX_PROPS_SHOWN=40 propositions plus both description layers. Building that
+# prompt from the actual shipped corpus (data/commanders.db) using the 10
+# longest-description artworks in the whole 5,530-artwork set — the real
+# worst case any batch could ever draw — produced a 63,085-character prompt:
+# roughly 15.8k-18k tokens depending on chars-per-token assumed for this
+# tokenizer, plus a ~1-2k token structured-JSON response for 10 judgments.
+# 32768 gives that ~40-70% headroom while still being an eighth of the
+# model's native window, so the VRAM/latency win over leaving it unset is
+# still enormous. Every other call path here — oracle judge (8192), oracle
+# router (4096), oracle expand (2048), /scry route()/expand() — fits inside
+# it with room to spare.
+PARAMETER num_ctx 32768
+
+# --- temperature --------------------------------------------------------
+# 0 for deterministic judging. Every call site in this repo already passes
+# its own explicit "temperature" in the request options (0 for judging,
+# routing and verification; 0.3 for the two theme-expansion calls), so in
+# practice this value is never exercised by ScryingPool code today — it
+# exists as a safe default for any caller (a manual curl, a future code
+# path) that forgets to set one, rather than inheriting qwen3.8's own
+# default of 1.
+PARAMETER temperature 0

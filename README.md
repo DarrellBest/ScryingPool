@@ -308,7 +308,8 @@ corpus. Nothing is hardcoded, so swap them freely.
 ```bash
 ollama pull qwen3.5:122b      # vision_model — must be multimodal; bigger is better here
 ollama pull nomic-embed-text  # embed_model  — must be an embedding model, not a chat model
-ollama pull qwen3.6           # judge_model  — routing, expansion, judging; text-only is fine
+ollama pull qwen3.8           # base model for judge_model / verify_model — see below
+ollama create scryingpool-qwen3.8 -f models/scryingpool.Modelfile
                               # judge_model doubles as verify_model; see below
 ```
 
@@ -318,14 +319,16 @@ the prebuilt corpus below, the descriptions are already written and the only mul
 handful of verification calls per search. That is what `verify_model` is for: it defaults to `vision_model`,
 and setting it to something smaller is the single highest-value knob on search latency.
 
-`config.toml` ships with `verify_model = "qwen3.6:latest"` — the same model as `judge_model`, deliberately.
-A search interleaves ~10 judge calls with ~7 verification calls, so if the two models cannot be resident at
-once (24 GiB + 81 GiB on a 96 GB card) Ollama evicts and reloads between every call. Measured on this
-machine that was ~71s of a ~156s query, about 46% of wall clock spent moving weights. Pointing both keys at
-one model makes it one resident instance: **~100s per query instead of ~180s, and zero evictions.** On 60
-real finalists it agreed with `qwen3.5:122b` on 100% of the compositional questions (counting figures,
-reading inscriptions, "walking away" vs "standing still") — see `config.toml` for the full breakdown.
-`embed_model` is the one that must match: changing it invalidates the shipped vectors.
+`config.toml` ships with `verify_model = "scryingpool-qwen3.8:latest"` — the same model as `judge_model`,
+deliberately, and not the base `qwen3.8` pull directly but a model built from `models/scryingpool.Modelfile`
+(`ollama create`, above). That Modelfile pins `num_ctx 32768`: left unset, Ollama sizes the KV cache for the
+model's own full 262,144-token window on every call, including the ones in `cts/judge.py` and `cts/search.py`
+that never set `num_ctx` themselves — see the Modelfile and `config.toml` for the incident that made this
+non-optional. A search interleaves ~10 judge calls with ~7 verification calls, so if the two models cannot be
+resident at once Ollama evicts and reloads between every call. Pointing both keys at one model makes it one
+resident instance, zero evictions — confirmed live via `ollama ps` showing exactly one judge/verify model
+loaded throughout a search, never two. `embed_model` is the one that must match: changing it invalidates the
+shipped vectors.
 
 **2. Install.** Three runtime dependencies; everything else is standard library.
 
@@ -398,14 +401,19 @@ optional piece; `--help` lists the rest.
 | [`scryingpool-edhrec-cache.tar.gz`](https://u.pcloud.link/publink/show?code=XZ1q4VJZ4dEerExbkn4uh3lCxmKNf5wnGNFX) | 74 MiB | `data/edhrec/` — 3,169 cached responses; optional, but skipping it costs ~45 min of rate-limited scraping on the first `ingest` | `014961e1e83750f4caffe636b9ba630b6b630cde11a612ddf0d655567d2300ec` |
 
 `data/bulk/` is deliberately not shipped — it is a re-downloadable Scryfall dump that `ingest` fetches itself.
-No model weights are shipped either: all three are public Ollama registry models, pulled by name.
+No model weights are shipped either: `vision_model` and `embed_model` are public Ollama registry models,
+pulled by name; `judge_model`/`verify_model` is a public registry model (`qwen3.8`) wrapped by
+`models/scryingpool.Modelfile` and built locally with `ollama create` — see the Quickstart step above.
 
 **On the models.** `config.toml` ships with the models this corpus was actually built on. Only `embed_model`
 has to match to reuse the shipped vectors — changing it invalidates every stored embedding. `judge_model` and
 `vision_model` are swapped freely. If you are reusing the shipped corpus you never run `describe` at all, so
 `vision_model` is never called and only `verify_model` needs to be multimodal — it is consulted for the eight
 verification calls at the end of a search. Leave it pointed at `judge_model` (the shipped default) unless you
-have VRAM to spare, since that is what keeps the two from evicting each other.
+have VRAM to spare, since that is what keeps the two from evicting each other. If you swap `judge_model` /
+`verify_model` for a different base, wrap it in a Modelfile the same way and pin a `num_ctx` sized for your
+prompts — see `models/scryingpool.Modelfile`'s comments for how that number was derived and why leaving it
+unset is a real, previously-hit bug, not a theoretical one.
 
 <sub>The published corpus was described in a single ~16-hour pass with <code>qwen3.5:122b</code> on an
 RTX PRO 6000 Blackwell (96 GB). Time scales with the vision model and the card, not with anything clever
@@ -613,10 +621,11 @@ resident.
 
 ### Searches during the weekly refresh are slow, and nothing is broken
 
-The API holds `judge_model` (~27GB of VRAM) continuously. The refresh's `describe` stage needs `vision_model`
+The API holds `judge_model` (~17.7GB of VRAM) continuously. The refresh's `describe` stage needs `vision_model`
 (81GB). They do not fit on the card together, so Ollama evicts one for the other and a search issued mid-refresh
-ping-pongs between them: minutes rather than ~80s, correct the whole time. `/health` reports it, and the bot's
-placeholder says so up front rather than leaving a four-minute Sunday-morning search unexplained.
+ping-pongs between them: minutes rather than the usual single-digit-minutes query time, correct the whole time.
+`/health` reports it, and the bot's placeholder says so up front rather than leaving a four-minute Sunday-morning
+search unexplained.
 
 Most weekly refreshes never load the vision model at all — `describe` only runs for genuinely new
 `illustration_id`s, and new artwork arrives in bursts every few weeks, not every week.

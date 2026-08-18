@@ -28,22 +28,58 @@ vision_model = "qwen3.5:122b"
 # paid on every search.
 #
 # The reason that matters is VRAM coexistence, not raw speed. A search interleaves
-# ~10 judge_model calls with ~7 verify calls. On a 96 GB card, judge (24 GiB) and
-# qwen3.5:122b (81 GiB) sum to 105 GiB and cannot both be resident, so Ollama
-# evicts and reloads between every single call — measured at ~71s of the ~156s mean
-# query, roughly 46% of wall clock spent loading weights that were just unloaded.
-# Pointing verify_model at the judge model makes it literally the same resident
-# instance: one load, zero evictions.
+# ~10 judge_model calls with ~7 verify calls. On a 96 GB card, judge and
+# qwen3.5:122b (81 GiB) sum to well over the card and cannot both be resident, so
+# Ollama evicts and reloads between every single call. Pointing verify_model at the
+# judge model makes it literally the same resident instance: one load, zero
+# evictions.
 #
-# Measured on 60 real finalists against qwen3.5:122b as reference: qwen3.6 agrees
-# 70% overall, but 100% on the compositional queries where careful looking is the
-# whole point (counting figures, reading inscriptions, "walking away" vs "standing
-# still"). Its disagreements are concentrated on "commanders that are <species>"
-# themes, and inspecting those crops by hand shows the 81 GB model is usually the
-# one in the wrong there — it reads "commander" as requiring a military figure and
-# rejects artwork that plainly matches. gemma4:31b scored the same 70% overall but
-# only 80% on the compositional set, and is ~2.5x slower per call.
-verify_model = "qwen3.6:latest"
+# As of 2026-08-18 this points at scryingpool-qwen3.8:latest, built from
+# models/scryingpool.Modelfile (`FROM qwen3.8`), not the base registry model
+# directly — the Modelfile pins PARAMETER num_ctx 32768 (qwen3.8 defaults to its
+# full 262,144-token window otherwise, which is what caused the 300s-timeout
+# incident documented at cts/oracle_judge.py::JUDGE_NUM_CTX; cts/judge.py's
+# judge_batch/verify_finalists and cts/search.py's route/expand never set num_ctx
+# per-call, so this Modelfile default is what actually bounds those calls) and
+# PARAMETER temperature 0 (belt-and-suspenders — every call site already passes
+# its own temperature explicitly). Rebuild with
+# `ollama create scryingpool-qwen3.8 -f models/scryingpool.Modelfile` after
+# editing that file. See models/scryingpool.Modelfile for the full sizing
+# rationale.
+#
+# qwen3.8 replaced qwen3.6 here because it is multimodal (vision + tools +
+# thinking, confirmed via `ollama show`) at ~17.7 GB resident vs. qwen3.6's
+# ~23 GB, and — same as before — pointing verify_model at judge_model keeps this
+# a one-resident-model setup with zero evictions between judge and verify calls
+# (confirmed live via `ollama ps` during a real search: exactly one
+# scryingpool-qwen3.8 instance resident alongside embed_model, never a second
+# distinct judge/verify model).
+#
+# Latency measured 2026-08-18, two real `cts search` runs on the shipped corpus:
+# ~217s cold (first call, model not yet loaded) and ~155s warm (model already
+# resident, zero evictions) — both slower than the ~77-95s qwen3.6 baseline this
+# config used to run at. qwen3.6 is architecture "qwen35moe" (36B total, mixture
+# of experts, only a fraction active per token); qwen3.8 is "qwen35" (27.3B
+# dense, all params active every token). Despite being smaller on disk, dense
+# qwen3.8 appears to cost more compute per call than sparse qwen3.6 did — this
+# reads as an architecture trade-off, not a misconfiguration. Quality on those
+# same two searches plus one `cts oracle` query looked sound: judge rationales
+# cited real, relevant propositions, fit scores were sensibly calibrated (1.0
+# unmistakable down to 0.6 for genuine stretches), and the oracle query's
+# filters and results were exactly right. This is a small spot-check, not the
+# rigorous 60-finalist study below — run `python -m cts eval` for that before
+# trusting the swap blind in production.
+#
+# Historical reference, from when this pointed at qwen3.6:latest: measured on 60
+# real finalists against qwen3.5:122b as reference, qwen3.6 agreed 70% overall,
+# but 100% on the compositional queries where careful looking is the whole point
+# (counting figures, reading inscriptions, "walking away" vs "standing still").
+# Its disagreements were concentrated on "commanders that are <species>" themes,
+# and inspecting those crops by hand showed the 81 GB model was usually the one in
+# the wrong there — it read "commander" as requiring a military figure and
+# rejected artwork that plainly matches. gemma4:31b scored the same 70% overall
+# but only 80% on the compositional set, and was ~2.5x slower per call.
+verify_model = "scryingpool-qwen3.8:latest"
 
 # Embedding model. Embeds every proposition (Phase 6). Must be an embedding
 # model, not a chat model. Changing this invalidates the stored vectors:
@@ -51,8 +87,11 @@ verify_model = "qwen3.6:latest"
 embed_model = "nomic-embed-text"
 
 # Judge / router model. Query routing, theme expansion, candidate judging and
-# the synthetic theme corpus (Phases 7, 8, 12). Text-only is fine.
-judge_model = "qwen3.6:latest"
+# the synthetic theme corpus (Phases 7, 8, 12). Text-only is fine, but as of
+# 2026-08-18 this is the same scryingpool-qwen3.8:latest model as verify_model —
+# see that key's comment for why (one resident model, zero evictions) and for
+# what models/scryingpool.Modelfile pins and why (num_ctx 32768, temperature 0).
+judge_model = "scryingpool-qwen3.8:latest"
 
 # --- Storage ------------------------------------------------------------
 
