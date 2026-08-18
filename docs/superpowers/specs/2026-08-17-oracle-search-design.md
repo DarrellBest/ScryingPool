@@ -183,7 +183,7 @@ make it *checkable at a glance*, which is the honest achievable goal and is stri
 
 ### What error rate to expect, stated as a projection and not a measurement
 
-This spec has not been run. The numbers below are **predictions**, and step 7 of *Order of work*
+This spec has not been run. The numbers below are **predictions**, and step 8 of *Order of work*
 exists specifically to replace them with measurements before the Discord surface ships.
 
 | Query class | Example | Expected precision@5 |
@@ -569,7 +569,8 @@ in under an hour. **The separation is the backup strategy.**
 -- one row per gameplay identity, straight from Scryfall's oracle_cards bulk
 CREATE TABLE IF NOT EXISTS cards (
   oracle_id      TEXT PRIMARY KEY,
-  name           TEXT,
+  name           TEXT,           -- verbatim, incl. "//" for multi-face cards
+  name_norm      TEXT,           -- fold(name); the L1 resolution key
   type_line      TEXT,
   oracle_text    TEXT,           -- verbatim; faces joined with "\n//\n" as ingest.py does
   mana_cost      TEXT,
@@ -583,12 +584,31 @@ CREATE TABLE IF NOT EXISTS cards (
   toughness_num  REAL,
   loyalty_num    REAL,
   keywords       TEXT,           -- JSON array, Scryfall's own
-  layout         TEXT,
+  layout         TEXT,           -- decides where image_uris lives; see /search
   reserved       INTEGER,
-  edhrec_rank    INTEGER,        -- the only popularity signal in this corpus
+  edhrec_rank    INTEGER,        -- popularity signal; also the ambiguity tie-break
   released_at    TEXT,
-  set_code       TEXT,           -- first printing, for the footer only
-  scryfall_uri   TEXT
+  set_code       TEXT,           -- the representative printing's, not "the" set
+  rarity         TEXT,           -- likewise: one printing's rarity
+  image_normal   TEXT,           -- *.scryfall.io, hot-linked, never downloaded
+  price_usd      REAL,           -- weekly snapshot; see /search on staleness
+  price_usd_foil REAL,
+  scryfall_uri   TEXT,
+  related_edhrec TEXT,           -- Scryfall's related_uris.edhrec, stored not derived
+  purchase_tcgplayer TEXT        -- Scryfall's purchase_uris.tcgplayer
+);
+
+-- one row per face. Carries the per-face name (so "Petty Theft" resolves) and
+-- the per-face image (transform cards have no top-level image_uris at all).
+CREATE TABLE IF NOT EXISTS card_faces (
+  oracle_id    TEXT,
+  face_index   INTEGER,          -- 0 front, 1 back
+  name         TEXT,
+  name_norm    TEXT,             -- the L2 resolution key
+  mana_cost    TEXT,
+  type_line    TEXT,
+  oracle_text  TEXT,
+  image_normal TEXT
 );
 
 -- normalized so "type: planeswalker, artifact" is one indexed IN (...)
@@ -631,12 +651,22 @@ CREATE TABLE IF NOT EXISTS judgments  (query_id INTEGER, oracle_id TEXT, fit REA
 CREATE TABLE IF NOT EXISTS meta       (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE INDEX IF NOT EXISTS idx_chunks_oracle_id   ON chunks(oracle_id);
+CREATE INDEX IF NOT EXISTS idx_cards_name_norm    ON cards(name_norm);
+CREATE INDEX IF NOT EXISTS idx_faces_name_norm    ON card_faces(name_norm);
+CREATE INDEX IF NOT EXISTS idx_faces_oracle_id    ON card_faces(oracle_id);
 CREATE INDEX IF NOT EXISTS idx_card_types_value   ON card_types(value, kind);
 CREATE INDEX IF NOT EXISTS idx_card_types_oracle  ON card_types(oracle_id);
 CREATE INDEX IF NOT EXISTS idx_legalities_format  ON card_legalities(format, status);
 CREATE INDEX IF NOT EXISTS idx_cards_cmc          ON cards(cmc);
 CREATE INDEX IF NOT EXISTS idx_judgments_query_id ON judgments(query_id);
 ```
+
+`cards.name_norm` gets an **index, deliberately not a UNIQUE constraint.** Names are believed
+unique per `oracle_id`, but "believed" is not "verified across 32,726 rows including un-sets", and a
+`UNIQUE` that turns out to be wrong fails the weekly ingest rather than degrading. The index gives
+the lookup speed; the ingest checkpoint **prints any collisions it finds**, so a real duplicate
+surfaces as a line of output instead of an outage. Same reasoning as the card-count checkpoint:
+report what is actually there rather than assert what should be.
 
 `source` on `judgments` reuses `db.HUMAN_SOURCES` (`{"human", "discord"}`) — that constant exists
 precisely so a new human-facing surface adds its value in one place, and `tests/test_provenance.py`
@@ -649,7 +679,7 @@ written, which is the habit the repo already has.
 the service design for why it belongs in `db.connect()` rather than at one call site applies
 identically to a second database file.
 
-Estimated size on disk: ~20MB cards, ~15MB chunks, ~292MB vectors, ~50MB indexes — **~380MB**.
+Estimated size on disk: ~25MB cards and faces, ~15MB chunks, ~292MB vectors, ~55MB indexes — **~390MB**. No images are stored; `image_normal` holds a URL, not a file.
 
 ### Do the two databases ever need joining?
 
@@ -679,8 +709,9 @@ be reported. No `ATTACH`, no cross-database query, ever.
 | Art BM25 (`rank_bm25` over 170,487 propositions) | ~400MB |
 | **Oracle index — ~95,000 × 768 float32** | **~292MB** |
 | **Oracle BM25 + chunk texts** | **~270MB** |
+| **Name resolution structures** — folded names, face names, sorted list, token index, bigram postings | **~60–80MB** |
 | Python, FastAPI, numpy, two SQLite connections | ~200MB |
-| **Total RSS, steady state** | **~1.7GB** |
+| **Total RSS, steady state** | **~1.8GB** |
 
 Against 62GB of RAM this is not close to a constraint, and it is worth saying so plainly rather
 than engineering around a limit that does not exist. Peak roughly doubles for *one* index during
@@ -855,7 +886,7 @@ The structural-only fast path is **under a second**, and no-Ollama degraded mode
 unjudged) is likewise sub-second.
 
 **These are projections from the art pipeline's measured per-call costs, not measurements.** Step
-7 of *Order of work* measures them before anything ships, and the README gets the measured
+8 of *Order of work* measures them before anything ships, and the README gets the measured
 numbers.
 
 ---
@@ -973,26 +1004,30 @@ user types**, so the disambiguation lands at the exact moment of choosing:
 | :-- | :-- | :-- |
 | `/scry` | *find commanders by what their ARTWORK depicts, means or evokes* | local art corpus, 5,530 artworks, ~80s |
 | `/oracle` | *find cards by what their RULES TEXT does — not a rules Q&A* | local oracle corpus, ~32,700 cards, ~30s |
-| `/search` | *look up one card by name* (planned) | Scryfall API, no local DB, sub-second |
+| `/search` | *look up one card by NAME* | **the same local oracle corpus**, ~32,700 cards, <½s |
 
-Three commands, three different questions, and the distinguishing word is capitalised in two of
-them because that is the word that decides which one you wanted.
+Three commands, three different questions, and the distinguishing word is capitalised in all three
+because that is the word that decides which one you wanted.
 
 ### Coexistence, and the two guards that make it work
 
-`/search <name>` is planned and not part of this design, but the boundary is, because the
-predictable user error is picking the wrong one of three commands and paying 30 seconds to find
-out.
+`/search <name>` is specified in full in *`/search` — name lookup on the same corpus* below. The
+boundary between the three still needs guards, because the predictable user error is picking the
+wrong one and paying 30 seconds to find out.
 
-**Guard 1: `/oracle` detects a card name before spending anything.** If the query string matches a
-row in `cards.name` exactly or near-exactly (case-insensitive, punctuation-stripped), reply
-immediately:
+**Guard 1: `/oracle` detects a card name before spending anything.** The query string is run
+through `/search`'s own resolver (below) at layers L0–L2 only — the exact-ish layers, never the
+fuzzy ones — and a hit replies immediately:
 
 > `"Sol Ring" is a card name. Try /search Sol Ring for the card itself — /oracle searches for
 > cards by what they do.`
 
-One indexed SQL lookup, no model calls, and it converts a 30-second wrong answer into an instant
-right one. `/search` gets the mirror guard when handed a sentence.
+A dictionary lookup, no model calls, and it converts a 30-second wrong answer into an instant right
+one. **Restricting the guard to the exact-ish layers is the point:** if it ran the fuzzy layers it
+would fire on genuine mechanical queries that happen to sit near some card's name — "counter target
+spell" is two edit operations from a card called *Counterspell* — and refuse to search at all. A
+guard that hijacks real queries is worse than no guard. `/search` gets the mirror guard when handed
+a sentence.
 
 **Guard 2: `/oracle` detects a rules question and refuses honestly.** A query opening with
 *"can I"*, *"does"*, *"how does"*, *"what happens if"*, *"when do I"* is a rules question, not a
@@ -1018,6 +1053,298 @@ Registered inside `serve/bot.py::register_commands` as a second `@tree.command` 
 the bot changes, since guild sync copies the whole tree. `mv_max` / `mv_min` are
 `app_commands.Range[int, 0, 30]`, which is where the *no operator parsing on the explicit path*
 property comes from. Every option is optional; `query` alone is the normal case.
+
+---
+
+## `/search` — name lookup on the same corpus
+
+`/search <name>` was previously sketched as a thin client over Scryfall's `/cards/named?fuzzy=`
+endpoint with no local database. **That is superseded. `/search` becomes a second surface on the
+oracle corpus specified above, with fuzzy matching implemented locally, and makes no Scryfall API
+call at query time — not even as a fallback.**
+
+### Why local, and why this is not a preference
+
+Two reasons, and the second is not negotiable.
+
+**One source of truth.** The oracle corpus already ingests all ~32,700 paper cards weekly. A second
+data path to the same cards can disagree with the first — different Oracle text, a card present in
+one and missing from the other — and "the bot gave two different answers for the same card" is a
+bug with no good explanation. One corpus, one refresh, one answer.
+
+**Scryfall's documented policy requires it.** Their rate-limits page, read live today, is explicit:
+
+| What they say | Verbatim |
+| :-- | :-- |
+| Hard limit on the exact endpoint we would use | `/cards/named` — **2/second (500ms)**. Same for `/cards/search`, `/cards/random`, `/cards/collection`. |
+| Consequence of exceeding it | HTTP 429, and *"Recieving an HTTP 429 response will result in your access being limited for 30 seconds."* |
+| Consequence of continuing | *"Continuing to overload the API after this point may result in a temporary or permanent ban of your application."* |
+| Whether backing off is optional | *"It is not acceptable to ignore HTTP 429 responses. You must act to reduce your application's overages."* |
+| Caching | *"We encourage you to cache the data you download from Scryfall or process it locally in your own system, at least for 24 hours."* |
+| **The instruction that decides this design** | *"**If you need to rapidly look up card names, prices, or resolve a large number of card images, you must use the bulk data files.**"* |
+
+Card-name lookup is called out **by name**, with *must*. A Discord command that fires one
+`/cards/named` per invocation is precisely the usage that sentence prohibits, and at 2 req/s a
+handful of friends typing at once would trip a 30-second lockout that takes down the command for
+everyone. Building it locally is compliance, not optimisation.
+
+Two more of their notes confirm decisions already in this design rather than changing them:
+
+- *"We only update prices for cards once per day. Fetching card data more frequently than 24 hours
+  will not yield new prices."*
+- *"If you only need gameplay information, downloading card data once per week or right after set
+  releases would most likely be sufficient."* — which is **exactly** the weekly refresh already
+  specified. The cadence was right for independent reasons and is now also the vendor's own
+  recommendation.
+
+And one that permits something: *"The direct file origins located at `*.scryfall.io` do not have
+rate limits."* **Card images may be hot-linked freely.** No local image storage, no image
+proxying, no caching layer — the embed carries a `*.scryfall.io` URL and Discord fetches it.
+
+### Cost profile — a different class from the other two commands
+
+`/search` makes **zero LLM calls**. No router, no expansion, no embedding, no judge. It touches
+neither Ollama nor the GPU.
+
+It therefore **does not take the shared search lock and is not counted against the queue cap.**
+This matters: a name lookup queued behind an 80-second `/scry` would be absurd, and the lock exists
+solely to serialise contention for one Ollama instance that `/search` never uses. It runs
+concurrently with a search in flight, on the event loop, reading in-memory structures and one
+indexed SQLite row.
+
+Because the work is ~20ms, **`/search` is the only one of the three commands that does not
+`defer()`** — it answers inside Discord's 3-second acknowledgement window with
+`interaction.response.send_message`, so there is no "thinking…" state at all. That visible
+difference is itself useful: the fast command *looks* fast.
+
+### Resolving a name
+
+This is the real engineering content of the feature, so it gets the space.
+
+#### Normalisation
+
+Card names are hostile to naive matching. They carry apostrophes (`Gaea's Cradle`, and both `'` and
+`'`), commas (`Atraxa, Praetors' Voice`), hyphens (`Nicol Bolas, God-Pharaoh`), diacritics
+(`Juzám Djinn`, `Lim-Dûl's Vault`, `Márton Stromgald`, `Jötun Grunt`), the `Æ` ligature
+(`Ærathi Berserker`), and the `//` face separator (`Fire // Ice`).
+
+`fold(name)` produces the matching key:
+
+1. NFKD decompose, drop combining marks — `Juzám` → `juzam`.
+2. An explicit ligature map: `Æ→ae`, `æ→ae`, `Œ→oe`, `œ→oe`, `ß→ss`, `Ø/ø→o`, `Þ→th`, `Ð→d`.
+   **NFKD does not decompose `Æ`** — it is an atomic letter, not a composed one — so without this
+   step `Ærathi Berserker` is unreachable by anyone typing `Aerathi`.
+3. Lowercase.
+4. **Delete** apostrophes rather than replacing them with space, so `Gaea's` → `gaeas` and a user
+   typing `Gaeas Cradle` matches. This reuses the exact convention `cts/links.py` already
+   established for EDHREC slugs (`_APOSTROPHES = str.maketrans("", "", "'’")`) — one folding habit
+   across the repo, not two.
+5. Every remaining non-alphanumeric character (including `//`) becomes a space.
+6. Collapse whitespace, strip.
+
+So `Lim-Dûl's Vault` → `lim duls vault`, `Æther Vial` → `aether vial`, `Fire // Ice` → `fire ice`.
+The output is not pretty; it only has to be **consistent between the stored name and the typed
+one**, which it is.
+
+#### The ladder, and why strict ordering is the correctness property
+
+Six layers. **Each fires only if every layer above it returned nothing.**
+
+| | Layer | Structure | Handles |
+| :-- | :-- | :-- | :-- |
+| **L0** | exact, raw bytes | `dict[str, str]` | paste from Scryfall, including `//` and diacritics |
+| **L1** | exact on `fold(name)` | `dict[str, str]` | case, punctuation, accents, `Æ` — **the overwhelming majority of real queries** |
+| **L2** | exact on a folded **face** name | `dict[str, list[str]]` | `Petty Theft`, `Insectile Aberration`, `Ice` |
+| **L3** | folded prefix | `bisect` over a sorted list | `atraxa praetors`, truncated typing |
+| **L4** | all query tokens present | `dict[token, set[int]]` | `voice atraxa`, `cradle gaea` — wrong order |
+| **L5** | bounded edit distance | bigram index + banded Levenshtein | genuine typos: `atraxs`, `lightnig bolt` |
+
+**The strict short-circuit is what prevents the failure mode that matters.** The dangerous
+behaviour in any fuzzy resolver is an eager fuzzy layer overriding an exact match — resolving a
+correctly-typed rare card to a more popular near-neighbour. Under strict ordering that is
+**structurally impossible**: a name with an L1 hit never reaches L5, so `Ancestral Recall` can never
+be "corrected" to `Ancestral Vision`, and `Fire` resolves at L2 to `Fire // Ice` rather than being
+prefix-matched into `Fireball`. Popularity is never consulted across layers — only ever as a
+tie-break *within* the single layer that fired.
+
+`edhrec_rank` (lower is more popular, NULL for many cards) is that tie-break. NULLs sort last.
+
+#### Ambiguity: list candidates, never silently pick
+
+A layer can return more than one card. The response depends on how many:
+
+| Hits | Response |
+| :-- | :-- |
+| **1** | Render the card. |
+| **2–10** | Render a **disambiguation list**, not a card: name, mana cost, type line, one per line, ordered by `edhrec_rank`. *"6 cards match `path`. Re-run with a fuller name."* |
+| **>10** | The same list truncated to 10, with the total: *"41 cards match `bolt` — showing the 10 most played. Be more specific."* |
+
+The disambiguation list is a **different render**, not a card embed with a warning. Showing one
+card and mentioning others in small text invites the reader to accept the one on screen.
+
+#### Disclosure when the input was not what matched
+
+Resolution via **L0–L2 is an exact match** and needs no comment. Resolution via **L3, L4 or L5
+changed the interpretation of what the user typed**, and the embed says so in its footer:
+
+> `matched "Ancestral Vision" from your input "ancestrl vsion" (edit distance 2)`
+
+Silently correcting input is how a user ends up reading the wrong card's text and never noticing.
+
+#### Rejected: SQLite FTS5
+
+FTS5 is the obvious tool and it is the wrong one here.
+
+- **The corpus is tiny.** ~32,700 names average ~20 characters — roughly **650KB of text**. The
+  in-memory structures above cost a fraction of the 292MB chunk matrix already resident. FTS5 is
+  built for corpora where an in-memory index is infeasible; this one is not remotely close.
+- **Availability is not guaranteed.** FTS5 is a compile-time SQLite option. It is present in
+  Debian/Ubuntu's `python3` but not universally, and a `sqlite3.OperationalError: no such module:
+  fts5` at ingest time would be a hard deployment failure for a feature needing none of FTS5's
+  power.
+- **It would be a second thing to keep in sync.** An FTS5 table is another structure the weekly
+  refresh must rebuild and another that can silently go stale, with its own fingerprint question.
+- **It does not do the hard part.** FTS5 gives tokenised and prefix matching — layers L3 and L4,
+  the easy ones. It has no edit distance, so L5 would still be hand-written. Adopting a dependency
+  that solves the easy half and not the hard half is the worst of both.
+
+**Everything is built in memory, alongside the chunk index, rebuilt on the same fingerprint.**
+No new dependency: `requirements.txt` stays at its three lines. `rapidfuzz` would be pleasant and
+is not worth the first new runtime dependency this project has taken.
+
+#### L5 performance — measured, not assumed
+
+The naive version is genuinely too slow and it is worth showing the arithmetic rather than
+hand-waving it. Pure-Python Levenshtein over two ~20-character strings is ~400 cell operations,
+call it 40–80µs. Sweeping all 32,726 names is **1.3–2.6 seconds per query** — far outside the
+sub-second promise, and paid on exactly the queries that are already going badly.
+
+So L5 prunes before it measures:
+
+1. **Bigram inverted index**, built once at index load: each folded name contributes its 2-grams to
+   `dict[str, set[int]]`. For a query, count bigram overlaps and keep candidates whose Dice
+   coefficient clears ~0.4, capped at the top 200 by overlap. This is set arithmetic over a few
+   dozen postings lists.
+2. **Length band.** Edit distance is at least the length difference, so names outside
+   `len(q) ± max_distance` are dropped for free.
+3. **Banded, early-terminating Levenshtein** on what survives — only the `2k+1` diagonal is
+   computed, and a row whose minimum exceeds `max_distance` aborts the pair.
+4. **`max_distance` scales with input length**: 1 for ≤4 characters, 2 for 5–8, 3 for 9+, never
+   more than 30% of the input. Without this, `Bolt` is within distance 4 of half the corpus.
+
+That puts L5 over ~50–200 candidates at roughly **15µs each, so under 5ms**.
+
+| Stage | Expected |
+| :-- | --: |
+| L0–L2 (dict lookups) | microseconds |
+| L3 (bisect) | microseconds |
+| L4 (set intersections) | <1ms |
+| L5 (prefilter + banded DP), **when it fires** | <5ms |
+| SQL fetch: card row, faces, legalities | ~1–2ms |
+| **Server-side total** | **<20ms**, p99 |
+| **User-visible** | **~200–400ms**, entirely Discord's round trip |
+
+**These are projections and a micro-benchmark over all 32,726 real names is part of the work**, for
+the same reason the search-latency numbers are: this document does not get to assert a performance
+claim it has not run. The benchmark is cheap — no Ollama, no network — so it belongs in the test
+suite as a skip-unless-corpus-present timing check rather than a one-off.
+
+#### Staleness, handled differently on purpose
+
+`/search` reads the same in-memory structures, kept current by the same 60-second background poll
+and the same oracle fingerprint. But it **does not trigger a synchronous rebuild** the way an
+`/oracle` search does — blocking a 20ms lookup for 3–5 seconds would destroy the one property that
+makes this command pleasant.
+
+The exception is precise: **when resolution fails entirely, `/search` checks the fingerprint and
+rebuilds once before reporting "no such card."** That is exactly the case where staleness could be
+the cause — a card from Sunday's set release — so the rebuild is paid only when it might be the
+answer, and never on the path that already succeeded.
+
+### Rendering
+
+One embed, built by `serve/oracle_render.py` alongside the `/oracle` renderer, same rules: pure
+functions returning plain dicts, stdlib only.
+
+| Element | Source |
+| :-- | :-- |
+| Title | `name` (the full name, including `//` for multi-face cards) |
+| URL | `scryfall_uri` |
+| **Image** | `image_normal`, hot-linked from `*.scryfall.io` — see the layout trap below |
+| Field: Mana cost / Mana value | `mana_cost`, `cmc` |
+| Field: Type | `type_line`, verbatim |
+| Description | the **full `oracle_text`**, verbatim, in a code block; both faces for multi-face cards, separated as Scryfall separates them |
+| Field: Set / Rarity | `set_code`, `rarity` — with the caveat below |
+| Field: Legality | formats where `status = 'legal'`; plus explicit `Banned in …` / `Restricted in …` |
+| Field: Price | `price_usd` (and `price_usd_foil` when present), **labelled with the refresh date** |
+| Links | `[Scryfall](scryfall_uri)` · `[EDHREC](related_edhrec)` · `[TCGplayer](purchase_tcgplayer)` |
+| Footer | resolution disclosure when it came from L3–L5; otherwise the refresh date |
+
+**The image URI is a layout trap, verified live rather than assumed.** Where `image_uris` lives
+depends on `layout`, and getting it wrong yields a blank embed for a whole card class:
+
+| Layout | Top-level `image_uris` | Per-face `image_uris` |
+| :-- | :-- | :-- |
+| `normal` (Sol Ring) | **present** | n/a |
+| `adventure` (Brazen Borrower) | **present** | **absent** |
+| `transform` (Delver of Secrets) | **absent** | **present on both faces** |
+
+So the rule is: **take top-level `image_uris.normal` if present, else `card_faces[0].image_uris.
+normal`.** Both branches occur in the real corpus and both are exercised by tests. For transform
+cards the back face's image is stored too, so a future "flip" button costs nothing — it is listed
+in *Not building* for now.
+
+**Links are stored, never derived.** `related_uris.edhrec` and `purchase_uris.tcgplayer` are
+supplied by Scryfall in the bulk file (verified live: `related_uris.edhrec` →
+`https://edhrec.com/route/?cc=Sol+Ring`). This matters because `cts/links.py`'s standing rule is
+that *"a reference that cannot be built is omitted, never guessed and never emitted as a broken
+link"* — and the alternative here would have been slugifying card names into EDHREC URLs and hoping.
+Absent keys mean absent links, exactly as `links_for` already behaves.
+
+**Prices are stale and the embed says so.** They are refreshed weekly, so they are **up to seven
+days old**, and Scryfall updates them only once daily in the first place — so a live fetch would buy
+at most six days of freshness in exchange for the API-call ban this whole section exists to avoid.
+The price field is labelled `USD (as of 2026-08-17)` using the refresh date, never presented as
+current. Scryfall's own footer disclaims that *"Absolutely no guarantee is made for any price
+information,"* and this design does not make a stronger claim than the source does.
+
+**Set and rarity are the representative printing's, not the card's.** `oracle_cards` carries one
+printing per card, so Sol Ring reports whatever set Scryfall picked (`msc` at the time of writing)
+and its rarity there — a card that is common in one set and rare in another has one of those two
+shown. The field is labelled `Set (one printing)` rather than implying it is the only one.
+
+**`/oracle` still shows no image, and that decision is unchanged** — but note that its guarantee is
+now weaker in kind. The earlier claim was that the oracle database holds no image URLs *at all*, so
+an `/oracle` embed could not grow one by accident. That is no longer true: `image_normal` exists in
+the schema for `/search`. The property is now enforced by the renderer and its test rather than by
+the absence of the data. Worth stating plainly, because a guarantee that quietly downgrades from
+"impossible" to "tested" should be re-declared rather than left to be discovered.
+
+### Endpoint
+
+**`GET /card?name=<string>`**, not `POST /search` — **`/search` is already taken by the art
+search** in `serve/api.py`, and reusing the path would be a genuine collision. The Discord command
+name and the HTTP route deliberately differ.
+
+Returns the resolved card and how it was resolved:
+
+```json
+{
+  "resolved": true,
+  "layer": "L1",
+  "input": "gaeas cradle",
+  "card": { "...": "every column plus faces, legalities, links" },
+  "candidates": [],
+  "service": {"index_built_at": "2026-08-17T03:44:11Z", "refreshed_at": "2026-08-17T03:43:02Z"}
+}
+```
+
+`resolved: false` with a populated `candidates` array is the disambiguation case and is a **200, not
+a 404** — the query was well-formed and the answer is "several". A genuine miss is
+`resolved: false` with `candidates: []`. Reporting `layer` is what makes the resolver debuggable
+from `curl` without reading logs.
+
+No lock, no queue, no `to_thread` — it is fast enough to run on the event loop.
 
 ---
 
@@ -1052,11 +1379,18 @@ One embed per result:
 | Footer | `first printed <SET> <year>` |
 | Links | `[Scryfall](…)` |
 
-**No image, no thumbnail, ever.** This is a decision, not an omission: an art thumbnail would
-invite the reader to judge a mechanical result on the picture, and the whole feature exists to
-separate those two questions. The oracle database stores no image URLs at all, so the embed cannot
-grow one by accident. It gets a test asserting the embed dict contains neither an `image` nor a
-`thumbnail` key.
+**No image, no thumbnail, ever — on `/oracle` results.** This is a decision, not an omission: a
+picture would invite the reader to judge a *ranked mechanical result* on its art, and the whole
+feature exists to separate those two questions. `/search` renders one card image, and the
+distinction is principled rather than inconsistent: `/search` returns a single card the user named
+outright, where the image is that card's primary identifier and there is no ranking for it to bias.
+
+**The guarantee is now enforced by the renderer, not by the absence of data.** An earlier draft
+claimed the oracle database held no image URLs at all, so an `/oracle` embed could not grow one by
+accident. `/search` makes that false — `cards.image_normal` exists. The property therefore rests on
+the renderer and its test, which asserts the `/oracle` embed dict contains neither an `image` nor a
+`thumbnail` key. A guarantee that weakens from *impossible* to *tested* is re-declared here rather
+than left for someone to discover.
 
 **Only two verified/passing colours, not three.** `serve/render.py` has `COLOR_VERIFIED`,
 `COLOR_PASSING` and `COLOR_STRETCH`, where the first two are distinguished by vision verification.
@@ -1081,6 +1415,7 @@ unit, no second entry in the machine inventory beyond the new database file.
 | :-- | :-- |
 | `POST /oracle/search` | `{query, k, filters: {types, colors, mv_min, mv_max, legal}}` → `execute`'s dict passed through unchanged, plus a `service` block |
 | `POST /oracle/feedback` | mirrors `/feedback`, keyed on `oracle_id`, `source='discord'`, idempotent by delete-then-insert |
+| `GET /card?name=<string>` | name resolution — see *`/search`*. No lock, no queue, no LLM call. 200 with `resolved:false` + `candidates` for ambiguity. |
 | `GET /health` | gains an `oracle` block |
 | `POST /admin/reload` | gains `{"index": "art" \| "oracle" \| "all"}`, defaulting to `"all"` |
 
@@ -1157,22 +1492,24 @@ test below preserves all of that. The `data/` tree is gitignored, so no test may
 | :-- | :-- |
 | **`tests/test_oracle_chunk.py`** | The heaviest new file, matching where the risk is. The chunker is a pure function of a card dict, so it is table-driven over real card text pasted into the module — the same convention `conftest.py`'s hand-picked `CORPUS` already uses. Cases: a vanilla creature (empty text → the whole-card chunk only); a two-ability enchantment (→ 2 + 1); a Saga; a DFC with `\n//\n`-joined faces (→ `face_index` 0 and 1); a card whose own name appears in its text (asserting `text_embedded` substitutes it and `text` does **not**); a keyword-only card (asserting reminder text is **kept**, because stripping it is the most likely well-intentioned regression); a card with `{T}:` and `+1/+1` (asserting no sentence-splitting happens); ordinals contiguous from 0. |
 | **`tests/test_oracle_filters.py`** | The second-highest-risk piece, because it fails silently. The compiler is a pure function from a filter dict to `(sql, params)`. Every English phrase in the calibration table, fed through a **stubbed router response** (never a live call), asserting the resulting operator — including the `<=` versus `<` pairs, which is where an inversion would live. UNION within a field, AND across fields. Hard filters survive an empty result; soft filters drop at zero and only at zero, broadest-first, with a note naming the dropped one. The 0–30 absurd-value guard. `power_num` NULL exclusion and the excluded-count note. The echo string, character for character, including that `colors` renders as `⊆` with its English gloss. The Scryfall URL round-tripping every filter it can express, and specifically that `colors: G` emits `id:g` (subset) and never `id>=g` — a link that disagrees with the search it came from is worse than no link. |
-| **`tests/test_oracle_render.py`** | Pure functions over canned result dicts, stdlib only, like `tests/test_render.py`. Full oracle text present verbatim in the description; the `▸` marker on the right line, derived from `ordinal`; the rationale positioned **after** the oracle text; **no `image` and no `thumbnail` key, ever** — that is a decision, so it gets a test, exactly as the "Popularity band, never Power level" string does today; the STRETCH label; the filter echo line; a 4,000-character oracle text truncating rather than 400-ing the message; an empty result set carrying the counts. |
+| **`tests/test_oracle_render.py`** | Pure functions over canned result dicts, stdlib only, like `tests/test_render.py`. **The `/search` embed too**, where the load-bearing case is the image-URI layout trap: a `normal` card (top-level `image_uris`), an `adventure` card (top-level present, faces empty) and a `transform` card (top-level **absent**, per-face present) must all render an image, because getting that rule backwards blanks a whole card class. Plus: the price field carries its as-of date and never claims to be current; absent `related_edhrec` / `purchase_tcgplayer` omit their links rather than emitting empty ones. Full oracle text present verbatim in the description; the `▸` marker on the right line, derived from `ordinal`; the rationale positioned **after** the oracle text; **no `image` and no `thumbnail` key, ever** — that is a decision, so it gets a test, exactly as the "Popularity band, never Power level" string does today; the STRETCH label; the filter echo line; a 4,000-character oracle text truncating rather than 400-ing the message; an empty result set carrying the counts. |
 | **`tests/test_oracle_judge.py`** | Batch-local chunk renumbering and citation validation, mirroring `tests/test_judge_props.py`: a citation belonging to another candidate is counted misattributed and dropped; one never shown is counted invented and dropped. **Plus a prompt-content test** asserting the mechanics rubric still names draw, loot, rummage, impulse, surveil, scry, reveal and tutor. A prompt edit that quietly deletes two of those lines is invisible in review and catastrophic in output. |
 | **`tests/test_oracle_staleness.py`** | The second fingerprint, mirroring `tests/test_staleness.py`: inserting a chunk moves it, inserting an embedding moves it, changing nothing does not, `meta.last_oracle_refresh_at` moves it. A rebuild that raises leaves the old index in place and marks `stale`. One poll tick checks both fingerprints and rebuilding one does not rebuild the other. |
 | **`tests/test_oracle_db.py`** | `init_schema` idempotence; all three pragmas set (mirroring `tests/test_db_pragmas.py`, including `busy_timeout`); and — the load-bearing one — **that opening and writing `oracle.db` opens no connection to `commanders.db`**, asserted by pointing both config paths at temp files and checking the art file is untouched. |
+| **`tests/test_oracle_names.py`** | The `/search` resolver, and the second-heaviest new file. `fold()` as a table-driven pure function over real names: `Juzám Djinn`, `Ærathi Berserker` (asserting NFKD alone is insufficient and the ligature map fires), `Lim-Dûl's Vault`, `Atraxa, Praetors' Voice`, `Fire // Ice`. Then the ladder: **each layer only fires when the ones above miss** — the correctness property — asserted directly by checking that an exact name never resolves through L5, that `Fire` resolves at L2 rather than prefix-matching into `Fireball`, and that `Ancestral Recall` is never "corrected" to `Ancestral Vision`. Ambiguity returns candidates rather than a card at 2–10 hits and truncates above 10. L3–L5 resolutions carry the disclosure string; L0–L2 do not. `max_distance` scales with input length so `Bolt` does not match half the corpus. |
+| **`tests/test_oracle_names_bench.py`** | The L5 timing check — the one claim in this document that is a performance assertion. Builds the bigram index over every real name and asserts p99 resolution stays under a stated bound. Skips cleanly when `data/oracle.db` is absent, exactly as `real_conn` already does, so it never breaks a fresh checkout. |
 | **`tests/test_oracle_guards.py`** | The card-name guard and the rules-question guard, both pure functions over a string plus an in-memory `cards` table. Three lines each, and they are what stop a user paying 30 seconds for a wrong-command answer. |
 | **`tests/test_api.py`** (extended) | `/oracle/search` happy path and validation; `mv_min > mv_max` is a 422; the **shared** lock genuinely serialises an `/oracle` behind a `/scry`; `/health` answers during an oracle search; `/admin/reload` with each of `art` / `oracle` / `all` rebuilds only what it names. |
 | **`tests/test_bot.py`** (extended) | The `/oracle` custom-id prefix (`sp:o1:`) never decodes as `sp:v1:` and vice versa — a real collision risk with two button families in one channel. |
 
-Expected total: **~300 tests, still zero network calls, still zero Ollama.**
+Expected total: **~325 tests, still zero network calls, still zero Ollama.**
 
 **Not tested, deliberately:** real Ollama responses, real Scryfall downloads, discord.py's gateway,
 and the systemd unit. Those are verified by one manual pass — a real `python -m cts oracle-ingest`,
 a real `/oracle`, one 👍, `journalctl --user -u scrying-api` — and that pass is the acceptance
 criterion for the deployment step.
 
-**And one thing that is measured rather than tested:** the eval set in step 7 of *Order of work*.
+**And one thing that is measured rather than tested:** the eval set in step 8 of *Order of work*.
 Precision on near-miss mechanics is a property of prompts and embeddings, not of code, so unit
 tests cannot assert it and pretending otherwise would be theatre. It needs 40 hand-labelled queries
 and a number.
@@ -1199,8 +1536,23 @@ Listed so nobody re-derives them as gaps:
 - **EDHREC data, power scores, prices, or popularity bands in this corpus.** `edhrec_rank` from the
   bulk file is the only popularity signal, used only to order the structural-only fast path. No
   45-minute EDHREC poll is added to the refresh.
-- **Card name lookup.** That is the planned `/search`, deliberately Scryfall-API-backed and
-  deliberately not in this local corpus.
+- **Any Scryfall API call at query time, from any command, including as a fallback.** The only
+  network access this project makes is the weekly bulk download. Their rate-limits page is explicit
+  that name lookup *"must use the bulk data files"*, and a per-invocation `/cards/named` at 2 req/s
+  is exactly the usage that prohibits. A "just fall back to the API when local resolution misses"
+  escape hatch is specifically rejected: it would fire precisely when many users are hitting
+  unusual names at once, which is when it would trip the 30-second lockout.
+- **Local image storage, downloading, caching or proxying.** Card images are hot-linked from
+  `*.scryfall.io`, which their docs state has no rate limit. Storing them would add hundreds of
+  megabytes and a sync problem to solve nothing.
+- **Any price freshness guarantee.** Prices are a weekly snapshot, up to seven days old, labelled
+  with their as-of date. Scryfall updates them once daily and disclaims their accuracy; this design
+  does not claim more than its source does.
+- **Card-name autocomplete on `/search`.** Discord supports it and the resident name index would
+  make it nearly free — but it fires on every keystroke, needs its own latency budget, and nobody
+  asked for it. Noted rather than built, because the structures it would need already exist.
+- **A "flip" button for transform cards.** The back face's image is stored, so this is cheap later.
+  One embed, front face, for now.
 - **Digital-only cards.** `game:paper`, per the decision. Alchemy rebalances would double some card
   names with different text and make every result ambiguous.
 - **Excluding silver-bordered and acorn cards by default.** They are paper Magic, the user asked for
@@ -1208,7 +1560,7 @@ Listed so nobody re-derives them as gaps:
   exclusion would be this design quietly deciding what counts as Magic.
 - **Rulings.** Scryfall publishes a `rulings` bulk file (5MB) and it is genuinely tempting as judge
   evidence. Out of scope: it is a second corpus with its own chunking, ingest and staleness
-  questions, and the value is unproven until the eval in step 7 shows where the judge actually
+  questions, and the value is unproven until the eval in step 8 shows where the judge actually
   fails.
 - **A second verification pass.** Argued above: the corpus is already ground truth, so a second
   read adds cost and no information.
@@ -1236,28 +1588,35 @@ Listed so nobody re-derives them as gaps:
    `cts/ingest.py`. Run it. **Look at the real card count and the real chunk count**, and put those
    in the README instead of this document's estimates. If the card count is not near 32,726, the
    exclusion list is wrong and this is where that surfaces.
-4. **`cts/oracle_embed.py`, then `cts/oracle_index.py`.** Time the embed pass and the index build.
+4. **`/search` end to end — resolver, endpoint, command, render.** It sequences here, immediately
+   after ingest, because it is the one piece that needs **no embeddings, no index, no judge and no
+   Ollama**: `cards` and `card_faces` alone are enough. That makes it independently shippable well
+   before the semantic pipeline works, and it is the cheapest possible end-to-end validation that
+   the corpus ingested correctly — if `/search Gaea's Cradle` returns the right card with the right
+   oracle text, image and legality, then ingest is sound. Includes the L5 micro-benchmark over all
+   ~32,700 real names, so the sub-20ms claim is measured before it is repeated anywhere.
+5. **`cts/oracle_embed.py`, then `cts/oracle_index.py`.** Time the embed pass and the index build.
    The "tens of minutes" and "3–5s" estimates become measurements here.
-5. **`cts/oracle_filters.py` and `tests/test_oracle_filters.py`.** Tests first — this is the piece
+6. **`cts/oracle_filters.py` and `tests/test_oracle_filters.py`.** Tests first — this is the piece
    that fails silently, and it is the piece three of the user's four clauses run through.
-6. **`cts/oracle_search.py`** and the `python -m cts oracle "…"` CLI. Route, expand, retrieve,
+7. **`cts/oracle_search.py`** and the `python -m cts oracle "…"` CLI. Route, expand, retrieve,
    filter, judge, print — with the filter echo line — so the whole thing can be exercised against
    real Ollama and the real corpus before any serving code exists.
-7. **Build the eval set and measure.** 40 hand-labelled mechanical queries, mirroring
+8. **Build the eval set and measure.** 40 hand-labelled mechanical queries, mirroring
    `eval/queries.jsonl`'s existing 15/15/10 split but weighted differently: ~15 unambiguous, ~15
    near-miss traps (draw vs loot vs impulse vs surveil; tokens vs copies; counter-spell vs
    counter-ability), ~10 vague-strategic. Measure precision@5 and the operator-parse accuracy
    separately. **This step comes before the Discord surface on purpose** — it is what converts this
    document's honest guesses into numbers, and if the near-miss precision lands near 55% rather
    than near 80%, the right response is to fix the judge prompt, not to ship it to people.
-8. **`serve/oracle_render.py` and its tests**, then `/oracle/search`, `/oracle/feedback`, the second
+9. **`serve/oracle_render.py` and its tests**, then `/oracle/search`, `/oracle/feedback`, the second
    fingerprint, and the `/health` and `/admin/reload` extensions. Verified with `curl` before
    Discord exists.
-9. **`serve/bot.py`:** the `/oracle` command, both guards, feedback buttons.
-10. **Append the three oracle stages to `cts/refresh.py`.** Run one full refresh by hand and confirm
+10. **`serve/bot.py`:** the `/oracle` command, both guards, feedback buttons.
+11. **Append the three oracle stages to `cts/refresh.py`.** Run one full refresh by hand and confirm
     the art stages are untouched and the oracle index picks up new data within a minute without a
     restart.
-11. **README section** with the measured numbers, and a machine-inventory note in
+12. **README section** with the measured numbers — including `/search`'s resolver benchmark — and a machine-inventory note in
     `~/.claude/CLAUDE.md`: one new database file (`data/oracle.db`, ~380MB), **no new port, no new
     unit, no new secret, and no new VRAM** — the last one being the fact anyone later wondering
     about GPU pressure should find there.
