@@ -403,7 +403,11 @@ def oracle_conn():
     connection.close()
 
 
-def make_oracle_engine(conn, oracle_conn, *, oracle_builder=None, **kwargs) -> Engine:
+def make_oracle_engine(
+    conn, oracle_conn, *, oracle_builder=None,
+    oracle_search_fn=None, oracle_search_index=None, oracle_search_index_builder=None,
+    **kwargs,
+) -> Engine:
     from cts import oracle_names
     from serve.api import oracle_fingerprint
 
@@ -415,6 +419,13 @@ def make_oracle_engine(conn, oracle_conn, *, oracle_builder=None, **kwargs) -> E
     engine.oracle = type(engine.oracle)(
         lambda: {"cards": 7, "chunks": 0,
                  "last_oracle_refresh_at": "2026-08-17T03:43:02+00:00"}
+    )
+    engine.oracle_search_fn = oracle_search_fn or support.StubOracleSearch()
+    engine.oracle_search_index = oracle_search_index if oracle_search_index is not None else (
+        support.StubOracleIndex()
+    )
+    engine.oracle_search_index_builder = (
+        oracle_search_index_builder or support.StubOracleSearchIndexBuilder()
     )
     return engine
 
@@ -713,3 +724,235 @@ def test_one_poll_tick_checks_both_fingerprints(conn, oracle_conn):
         assert (art.calls, oracle.calls) == (0, 1)       # ...and the oracle one rebuilt
 
     asyncio.run(scenario())
+
+
+# ============================================================================
+# POST /oracle/search, POST /oracle/feedback
+# ============================================================================
+
+
+@pytest.fixture
+def oracle_searcher():
+    return support.StubOracleSearch()
+
+
+@pytest.fixture
+def oracle_client(conn, oracle_conn, oracle_searcher):
+    engine = make_oracle_engine(conn, oracle_conn, oracle_search_fn=oracle_searcher)
+    with TestClient(create_app(engine)) as test_client:
+        test_client.engine = engine
+        yield test_client
+
+
+def test_oracle_search_passes_executes_dict_through_verbatim(oracle_client):
+    resp = oracle_client.post("/oracle/search", json={"query": "cards that draw"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) >= {"query_id", "plan", "results", "pool", "message", "service"}
+    assert body["query_id"] == support.ORACLE_OUTCOME["query_id"]
+
+
+def test_oracle_search_forwards_filters_to_the_search_function(oracle_client, oracle_searcher):
+    oracle_client.post(
+        "/oracle/search",
+        json={"query": "cards that draw", "types": ["enchantment"], "colors": "g",
+              "mv_max": 5, "k": 3},
+    )
+    call = oracle_searcher.calls[0]
+    assert call["types"] == ("enchantment",)
+    assert call["colors"] == "G"
+    assert call["mv_max"] == 5
+    assert call["k"] == 3
+    assert call["kind"] == "user"
+
+
+def test_oracle_search_400s_when_mv_min_exceeds_mv_max(oracle_client):
+    resp = oracle_client.post(
+        "/oracle/search", json={"query": "x", "mv_min": 6, "mv_max": 3}
+    )
+    assert resp.status_code == 422
+
+
+def test_oracle_search_rejects_mv_outside_zero_to_thirty(oracle_client):
+    assert oracle_client.post("/oracle/search", json={"query": "x", "mv_max": 999}).status_code == 422
+
+
+def test_oracle_search_colors_are_validated_the_same_way_search_is(oracle_client):
+    resp = oracle_client.post("/oracle/search", json={"query": "x", "colors": "z"})
+    assert resp.status_code == 422
+
+
+def test_oracle_search_503s_when_no_oracle_corpus_is_configured(conn):
+    engine = make_engine(conn)   # no oracle corpus at all
+    with TestClient(create_app(engine)) as client:
+        resp = client.post("/oracle/search", json={"query": "cards that draw"})
+    assert resp.status_code == 503
+
+
+def test_oracle_search_and_scry_share_the_same_lock_and_queue(conn, oracle_conn):
+    """The design's explicit decision: one shared lock, not two — an /oracle
+    search queued behind a /scry (and vice versa) is the correct behaviour,
+    not a bug, because both contend for the same Ollama instance."""
+    art_searcher = support.StubSearch(delay=0.3)
+    oracle_searcher = support.StubOracleSearch()
+    engine = make_oracle_engine(
+        conn, oracle_conn, search_fn=art_searcher, oracle_search_fn=oracle_searcher
+    )
+    with TestClient(create_app(engine)) as client:
+        started = threading.Event()
+
+        def run_scry():
+            client.post("/search", json={"theme": "lonely"})
+
+        worker = threading.Thread(target=run_scry)
+        worker.start()
+        assert art_searcher.started.wait(5)
+        started.set()
+
+        begin = time.monotonic()
+        resp = client.post("/oracle/search", json={"query": "cards that draw"})
+        elapsed = time.monotonic() - begin
+        worker.join(10)
+
+    assert resp.status_code == 200
+    assert elapsed >= 0.2, "the /oracle search must have waited behind the /scry search"
+
+
+def test_oracle_search_is_a_503_busy_when_the_shared_queue_is_full(conn, oracle_conn):
+    slow = support.StubOracleSearch(delay=0.3)
+    engine = make_oracle_engine(conn, oracle_conn, oracle_search_fn=slow, max_queued=1)
+    with TestClient(create_app(engine)) as client:
+        worker = threading.Thread(
+            target=lambda: client.post("/oracle/search", json={"query": "x"})
+        )
+        worker.start()
+        assert slow.started.wait(5)
+        resp = client.post("/oracle/search", json={"query": "y"})
+        worker.join(10)
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "busy"
+
+
+def test_oracle_search_rebuilds_the_index_when_the_fingerprint_moved(conn, oracle_conn):
+    builder = support.StubOracleBuilder(conn=oracle_conn)
+    search_builder = support.StubOracleSearchIndexBuilder(
+        indexes=[support.StubOracleIndex(label="rebuilt")]
+    )
+    engine = make_oracle_engine(
+        conn, oracle_conn, oracle_builder=builder, oracle_search_index_builder=search_builder,
+    )
+    with TestClient(create_app(engine)) as client:
+        oracle_conn.execute(
+            "INSERT INTO chunks(id, oracle_id, face_index, ordinal, kind, text) "
+            "VALUES (1, 'o-sol', 0, 0, 'whole', 'x')"
+        )
+        oracle_conn.commit()
+        resp = client.post("/oracle/search", json={"query": "cards that draw"})
+    assert resp.status_code == 200
+    assert resp.json()["service"]["oracle_index_rebuilt"] is True
+    assert search_builder.calls == 1
+    assert engine.oracle_search_index.label == "rebuilt"
+
+
+def test_a_failed_search_index_rebuild_does_not_block_the_name_index(conn, oracle_conn):
+    """The two rebuilds are independent: a broken chunk index must not stop
+    /card's name resolution from picking up fresh data."""
+    search_builder = support.StubOracleSearchIndexBuilder(raises=RuntimeError("disk on fire"))
+    engine = make_oracle_engine(conn, oracle_conn, oracle_search_index_builder=search_builder)
+    with TestClient(create_app(engine)) as client:
+        oracle_conn.execute(
+            "INSERT INTO cards(oracle_id, name, name_norm) VALUES ('o-new', 'Nadu', 'nadu')"
+        )
+        oracle_conn.execute(
+            "INSERT INTO chunks(id, oracle_id, face_index, ordinal, kind, text) "
+            "VALUES (1, 'o-new', 0, 0, 'whole', 'x')"
+        )
+        oracle_conn.commit()
+        body = client.get("/card", params={"name": "Nadu"}).json()
+    assert body["resolved"] is True
+    assert engine.oracle_stale is False    # the name index rebuilt fine
+    assert search_builder.calls == 1
+
+
+@pytest.fixture
+def feedback_client(tmp_path):
+    """`write_oracle_feedback` opens its own connection on `cfg.oracle_db_path`
+    (mirroring `write_feedback`), so this needs a real file on disk — an
+    in-memory `oracle_conn` shared only with the resolver would not be visible
+    to it. Same convention `tests/test_feedback.py` already uses for `/scry`."""
+    from cts import oracle_db as odb
+
+    cfg = support.config()
+    cfg = type(cfg)(**{**cfg.__dict__, "oracle_db_path": str(tmp_path / "oracle.db")})
+    oconn = odb.connect(cfg)
+    oconn.execute(
+        "INSERT INTO cards(oracle_id, name, name_norm) VALUES ('o-sol', 'Sol Ring', 'sol ring')"
+    )
+    oconn.commit()
+
+    conn = support.memory_conn()
+    engine = make_oracle_engine(conn, oconn, oracle_search_fn=support.StubOracleSearch())
+    engine.cfg = cfg
+    with TestClient(create_app(engine)) as test_client:
+        test_client.oconn = oconn
+        yield test_client
+    conn.close()
+    oconn.close()
+
+
+def test_oracle_feedback_records_a_discord_vote(feedback_client):
+    feedback_client.oconn.execute("INSERT INTO queries(id, text, kind) VALUES (55, 'x', 'user')")
+    feedback_client.oconn.commit()
+    resp = feedback_client.post(
+        "/oracle/feedback",
+        json={"query_id": 55, "oracle_id": "o-sol", "accepted": True, "discord_user_id": "123"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    row = feedback_client.oconn.execute(
+        "SELECT fit, source FROM judgments WHERE query_id = 55 AND oracle_id = 'o-sol'"
+    ).fetchone()
+    assert row["fit"] == 1.0
+    assert row["source"] == "discord"
+
+
+def test_oracle_feedback_is_idempotent(feedback_client):
+    feedback_client.oconn.execute("INSERT INTO queries(id, text, kind) VALUES (56, 'x', 'user')")
+    feedback_client.oconn.commit()
+    payload = {"query_id": 56, "oracle_id": "o-sol", "accepted": True}
+    feedback_client.post("/oracle/feedback", json=payload)
+    resp = feedback_client.post("/oracle/feedback", json={**payload, "accepted": False})
+    assert resp.json()["replaced"] is True
+    rows = feedback_client.oconn.execute(
+        "SELECT fit FROM judgments WHERE query_id = 56 AND oracle_id = 'o-sol' AND source = 'discord'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["fit"] == 0.0
+
+
+def test_oracle_feedback_404s_for_an_unknown_query(feedback_client):
+    resp = feedback_client.post(
+        "/oracle/feedback", json={"query_id": 999999, "oracle_id": "o-sol", "accepted": True}
+    )
+    assert resp.status_code == 404
+
+
+def test_health_oracle_block_gains_chunk_index_stats(oracle_client):
+    body = oracle_client.get("/health").json()
+    oracle = body["oracle"]
+    assert oracle["chunks"] == support.StubOracleIndex().chunks
+    assert oracle["dim"] == support.StubOracleIndex().dim
+    assert oracle["missing_embeddings"] == 0
+
+
+def test_admin_reload_oracle_rebuilds_the_search_index_too(conn, oracle_conn):
+    name_builder = support.StubOracleBuilder(conn=oracle_conn)
+    search_builder = support.StubOracleSearchIndexBuilder()
+    engine = make_oracle_engine(
+        conn, oracle_conn, oracle_builder=name_builder, oracle_search_index_builder=search_builder,
+    )
+    with TestClient(create_app(engine)) as client:
+        body = client.post("/admin/reload", params={"index": "oracle"}).json()
+    assert name_builder.calls == 1
+    assert search_builder.calls == 1
+    assert body["oracle_chunks"] == support.StubOracleIndex(label="build-1").chunks

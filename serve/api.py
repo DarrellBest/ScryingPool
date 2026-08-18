@@ -40,11 +40,14 @@ from typing import Any, Callable
 import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cts import db, ollama as ollama_mod, oracle_db, oracle_names, search as search_mod
+from cts import oracle_index as oracle_index_mod, oracle_search as oracle_search_mod
 from cts.config import Config, load_config
 from cts.index import SearchIndex, load_index
+from cts.oracle_filters import Filters
+from cts.oracle_index import OracleIndex
 
 # --------------------------------------------------------------------------- constants
 
@@ -215,6 +218,26 @@ def build_name_index(cfg: Config) -> oracle_names.NameIndex:
         conn.close()
 
 
+def build_oracle_search_index(cfg: Config) -> OracleIndex:
+    """Build `/oracle`'s chunk index (vectors + BM25) on a connection of its
+    own, same discipline as `build_name_index` right above: a rebuild is read
+    only and must never touch the resident `oracle_conn` handle, which only
+    the event loop is allowed to use.
+
+    Rebuilt on the **same** fingerprint as the name index — both depend on
+    exactly `chunks` / `chunk_embeddings` / `last_oracle_refresh_at` moving —
+    so `ensure_oracle_current` rebuilds the two together rather than adding a
+    second poller for a check that would cost the same three index seeks
+    twice.
+    """
+    conn = sqlite3.connect(f"file:{Path(cfg.oracle_db_path)}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return oracle_index_mod.load_index(cfg, conn)
+    finally:
+        conn.close()
+
+
 def read_oracle_stats(cfg: Config) -> dict:
     """Card count and last oracle refresh stamp, on a throwaway read-only handle.
 
@@ -363,6 +386,50 @@ def write_feedback(
         conn.close()
 
 
+def write_oracle_feedback(
+    cfg: Config, *, query_id: int, oracle_id: str, accepted: bool, discord_user_id: str | None,
+) -> dict:
+    """`/oracle/feedback`'s write side. Mirrors `write_feedback` exactly, one
+    level down: same idempotent delete-then-insert so a double-tapped 👍 never
+    inserts twice, same `query_id` validation against a real logged query, and
+    the same literal `'discord'` source string the art side's `db.HUMAN_SOURCES`
+    already recognises — a future export reading both databases sees one
+    spelling of "a person clicked this," not two."""
+    conn = oracle_db.connect(cfg)
+    try:
+        if conn.execute("SELECT 1 FROM queries WHERE id = ?", (query_id,)).fetchone() is None:
+            return {"found": False, "replaced": False}
+
+        judged = conn.execute(
+            "SELECT chunk_ids FROM judgments WHERE query_id = ? AND oracle_id = ? "
+            "AND source = 'judge' ORDER BY rowid DESC LIMIT 1",
+            (query_id, oracle_id),
+        ).fetchone()
+        chunk_ids = (judged[0] if judged and judged[0] else None) or json.dumps([])
+
+        cursor = conn.execute(
+            "DELETE FROM judgments WHERE query_id = ? AND oracle_id = ? AND source = 'discord'",
+            (query_id, oracle_id),
+        )
+        replaced = cursor.rowcount > 0
+
+        who = f"discord user {discord_user_id}" if discord_user_id else "a discord user"
+        verdict = "acceptable" if accepted else "not acceptable"
+        conn.execute(
+            "INSERT INTO judgments(query_id, oracle_id, fit, rationale, chunk_ids, model, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'discord')",
+            (
+                query_id, oracle_id, 1.0 if accepted else 0.0,
+                f"{who} marked this result {verdict} from the /oracle results",
+                chunk_ids, "",
+            ),
+        )
+        conn.commit()
+        return {"found": True, "replaced": replaced}
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------------------------ probes
 
 
@@ -495,6 +562,9 @@ class Engine:
         oracle_fingerprint_value: Fingerprint | None = None,
         oracle_index_builder: Callable[[Config], Any] | None = None,
         oracle_stats: Callable[[], dict] | None = None,
+        oracle_search_fn: Callable[..., dict] | None = None,
+        oracle_search_index: OracleIndex | None = None,
+        oracle_search_index_builder: Callable[[Config], OracleIndex] | None = None,
         max_queued: int = MAX_QUEUED,
         poll_seconds: float = POLL_SECONDS,
         poll_debounce_seconds: float = POLL_DEBOUNCE_SECONDS,
@@ -522,6 +592,16 @@ class Engine:
         self.oracle = _Cached(oracle_stats or (lambda: read_oracle_stats(cfg)))
         self.oracle_built_at = _utcnow()
         self.oracle_stale = False
+
+        # --- /oracle: the chunk search index, rebuilt on the SAME fingerprint
+        # as the name index above (see build_oracle_search_index's docstring).
+        # `oracle_search_fn` is `cts.oracle_search.execute` by default, and
+        # takes the shared search lock below — /oracle and /scry contend for
+        # the same Ollama instance and the same judge_model weights, so one
+        # lock, not two.
+        self.oracle_search_fn = oracle_search_fn or oracle_search_mod.execute
+        self.oracle_search_index = oracle_search_index
+        self.oracle_search_index_builder = oracle_search_index_builder or build_oracle_search_index
         # Guards the name-index rebuild only. It is NOT a second search queue:
         # /card takes no lock at all on its fast path, because a name lookup
         # queued behind an 80-second /scry would be absurd and the shared search
@@ -619,17 +699,39 @@ class Engine:
             if not force and fingerprint == self.oracle_index_fingerprint:
                 return False
 
+            # Both indexes key off exactly this fingerprint (chunks /
+            # chunk_embeddings / last_oracle_refresh_at), so one rebuild pass
+            # triggers both rather than adding a second poll for a check that
+            # would cost the same three index seeks twice. They are rebuilt
+            # independently, not as one all-or-nothing step: `/card` depends
+            # only on the name index, `/oracle` only on the chunk index, and a
+            # failure building one must not stop the other from picking up
+            # fresh data it is perfectly able to serve.
             try:
-                index = await asyncio.to_thread(self.oracle_index_builder, self.cfg)
+                name_index = await asyncio.to_thread(self.oracle_index_builder, self.cfg)
             except Exception:                    # noqa: BLE001 - keep serving
                 traceback.print_exc()
                 self.oracle_stale = True
                 return False
 
-            self.name_index = index
+            self.name_index = name_index
             self.oracle_index_fingerprint = fingerprint
             self.oracle_built_at = _utcnow()
             self.oracle_stale = False
+
+            try:
+                self.oracle_search_index = await asyncio.to_thread(
+                    self.oracle_search_index_builder, self.cfg
+                )
+            except Exception:                    # noqa: BLE001 - the name index still rebuilt
+                traceback.print_exc()
+                # Not `self.oracle_stale = True`: that flag means "the name
+                # index — which /search and /card depend on — is stale", and
+                # it just successfully rebuilt. `cts.oracle_search.execute`
+                # falls back to building its own index inline when handed
+                # `index=None`, so a search still works; it is just slower
+                # until the next successful poll.
+
             return True
 
     def oracle_refreshed_at(self) -> str | None:
@@ -815,6 +917,65 @@ class Engine:
                 "the index — run 'python -m cts embed'"
             )
 
+    # ------------------------------------------------------------------ oracle search
+
+    async def oracle_search(
+        self, *, query: str, k: int, types: tuple[str, ...], colors: str | None,
+        mv_min: int | None, mv_max: int | None, legal: tuple[str, ...],
+    ) -> dict:
+        """One `/oracle` search, on the SAME shared lock and queue `/scry`
+        uses — they contend for the same Ollama instance and the same
+        `judge_model` weights, so a second queue would only move the
+        contention somewhere it cannot be reported, per the design doc."""
+        if self.oracle_conn is None:
+            raise OracleCorpusUnavailable("the oracle corpus is not configured")
+        if self._pending >= self.max_queued:
+            raise Busy(self._pending, self.max_queued)
+
+        self._pending += 1
+        waiting_since = time.monotonic()
+        try:
+            async with self.lock:
+                queued_seconds = time.monotonic() - waiting_since
+                self._active = True
+                try:
+                    rebuilt = await self.ensure_oracle_current()
+                    started = time.monotonic()
+                    outcome = await asyncio.to_thread(
+                        self.oracle_search_fn,
+                        self.cfg,
+                        query,
+                        types=types,
+                        colors=colors,
+                        mv_min=mv_min,
+                        mv_max=mv_max,
+                        legal=legal,
+                        k=k,
+                        kind="user",
+                        conn=self.oracle_conn,
+                        index=self.oracle_search_index,
+                        name_index=self.name_index,
+                    )
+                    elapsed = time.monotonic() - started
+                finally:
+                    self._active = False
+        finally:
+            self._pending -= 1
+
+        self.searches_since_start += 1
+        self.last_search_seconds = round(elapsed, 3)
+
+        if isinstance(outcome, dict):
+            outcome = dict(outcome)
+            outcome["service"] = {
+                "oracle_index_rebuilt": rebuilt,
+                "oracle_index_built_at": _iso(self.oracle_built_at),
+                "queued_seconds": round(queued_seconds, 3),
+                "refresh_running": await self.refresh.get(),
+                "degraded": _oracle_degraded(outcome),
+            }
+        return outcome
+
     # ------------------------------------------------------------------------- health
 
     def _oracle_health(self, now: datetime) -> dict | None:
@@ -827,11 +988,22 @@ class Engine:
         if self.oracle_conn is None or self.name_index is None:
             return None
         stats = self._oracle_stats_cache or {}
+        search_index = self.oracle_search_index
+        # `chunks`/`dim`/`missing_embeddings` describe the CHUNK index that
+        # `/oracle` searches, not the name index `/search` and `/card` use —
+        # reported from the resident index itself when it exists (accurate at
+        # this instant) and falling back to the throwaway-connection COUNT(*)
+        # only before the first successful build.
+        build_seconds = getattr(self.name_index, "build_seconds", 0.0)
+        if search_index is not None:
+            build_seconds += getattr(search_index, "build_seconds", 0.0)
         return {
             "cards": getattr(self.name_index, "card_count", 0),
             "names": getattr(self.name_index, "name_count", 0),
-            "chunks": stats.get("chunks"),
-            "build_seconds": round(getattr(self.name_index, "build_seconds", 0.0), 3),
+            "chunks": len(search_index) if search_index is not None else stats.get("chunks"),
+            "dim": getattr(search_index, "dim", None),
+            "missing_embeddings": getattr(search_index, "missing_embeddings", None),
+            "build_seconds": round(build_seconds, 3),
             "built_at": _iso(self.oracle_built_at),
             "age_seconds": round((now - self.oracle_built_at).total_seconds(), 1),
             "stale": self.oracle_stale,
@@ -904,6 +1076,15 @@ def _degraded(outcome: dict) -> bool:
     return bool(notes) or plan.get("vision_verified") is False
 
 
+def _oracle_degraded(outcome: dict) -> bool:
+    """Same idea as `_degraded`, minus the vision-verification flag this
+    pipeline does not have — there is no verify stage for `/oracle` at all."""
+    plan = outcome.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    return bool(plan.get("notes"))
+
+
 # --------------------------------------------------------------------- request models
 
 
@@ -944,6 +1125,57 @@ class FeedbackRequest(BaseModel):
     discord_user_id: str | None = None
 
 
+def _validate_colors_subset(value: str | None) -> str | None:
+    """Shared by `/search` and `/oracle` — the same letters mean the same
+    thing on both commands, and a duplicated validator is how they would
+    quietly stop agreeing."""
+    if value is None:
+        return None
+    cleaned = value.strip().upper()
+    if not cleaned:
+        return None
+    unknown = sorted(set(cleaned) - set(WUBRG))
+    if unknown:
+        raise ValueError(f"colors must be a subset of WUBRG; {''.join(unknown)!r} is not")
+    return "".join(sorted(set(cleaned), key=WUBRG.index))
+
+
+class OracleSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=300)
+    k: int = Field(default=5, ge=1, le=5)
+    types: list[str] = Field(default_factory=list)
+    colors: str | None = None
+    mv_min: int | None = Field(default=None, ge=0, le=30)
+    mv_max: int | None = Field(default=None, ge=0, le=30)
+    legal: list[str] = Field(default_factory=list)
+
+    @field_validator("query")
+    @classmethod
+    def _query_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query must not be blank")
+        return stripped
+
+    @field_validator("colors")
+    @classmethod
+    def _colors_subset(cls, value: str | None) -> str | None:
+        return _validate_colors_subset(value)
+
+    @model_validator(mode="after")
+    def _mv_min_not_above_mv_max(self) -> "OracleSearchRequest":
+        if self.mv_min is not None and self.mv_max is not None and self.mv_min > self.mv_max:
+            raise ValueError(f"mv_min ({self.mv_min}) must not be greater than mv_max ({self.mv_max})")
+        return self
+
+
+class OracleFeedbackRequest(BaseModel):
+    query_id: int
+    oracle_id: str = Field(min_length=1)
+    accepted: bool
+    discord_user_id: str | None = None
+
+
 # --------------------------------------------------------------------------------- app
 
 
@@ -955,8 +1187,8 @@ def build_engine(config_path: str = "config.toml") -> Engine:
     index = load_index(cfg, conn)
 
     # The oracle corpus is optional at startup: a checkout that has not run
-    # `python -m cts oracle-ingest` still serves /scry, and /card says exactly
-    # what is missing rather than 500ing.
+    # `python -m cts oracle-ingest` still serves /scry, and /card and /oracle
+    # say exactly what is missing rather than 500ing.
     oracle_conn = open_oracle_connection(cfg)
     return Engine(
         cfg,
@@ -966,6 +1198,7 @@ def build_engine(config_path: str = "config.toml") -> Engine:
         oracle_conn=oracle_conn,
         name_index=build_name_index(cfg),
         oracle_fingerprint_value=oracle_fingerprint(oracle_conn),
+        oracle_search_index=build_oracle_search_index(cfg),
     )
 
 
@@ -1048,6 +1281,54 @@ def create_app(engine: Engine | None = None, *, config_path: str = "config.toml"
                     "status": "error",
                     "detail": f"no query {request.query_id}: nothing was recorded",
                 },
+            )
+        return JSONResponse(content={"ok": True, "replaced": result["replaced"]})
+
+    @app.post("/oracle/search")
+    async def oracle_search_endpoint(request: OracleSearchRequest) -> JSONResponse:
+        """`execute()`'s dict passed through unchanged, plus a `service` block
+        — same contract discipline as `/search`. Shares `/search`'s queue and
+        lock (see `Engine.oracle_search`), so a `503 busy` here counts an
+        `/oracle` search queued behind a `/scry` and vice versa."""
+        engine_: Engine = app.state.engine
+        try:
+            outcome = await engine_.oracle_search(
+                query=request.query, k=request.k, types=tuple(request.types),
+                colors=request.colors, mv_min=request.mv_min, mv_max=request.mv_max,
+                legal=tuple(request.legal),
+            )
+        except OracleCorpusUnavailable as exc:
+            return JSONResponse(status_code=503, content={"status": "unavailable", "detail": str(exc)})
+        except Busy as busy:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "busy", "queued": busy.queued, "max_queued": busy.max_queued},
+            )
+        except Exception as exc:                 # noqa: BLE001 - the bot needs a body, not a 502
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"status": "error", "detail": str(exc)})
+        return JSONResponse(content=json.loads(json.dumps(outcome, default=str)))
+
+    @app.post("/oracle/feedback")
+    async def oracle_feedback(request: OracleFeedbackRequest) -> JSONResponse:
+        engine_: Engine = app.state.engine
+        try:
+            result = await asyncio.to_thread(
+                write_oracle_feedback,
+                engine_.cfg,
+                query_id=request.query_id,
+                oracle_id=request.oracle_id,
+                accepted=request.accepted,
+                discord_user_id=request.discord_user_id,
+            )
+        except Exception as exc:                 # noqa: BLE001
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"status": "error", "detail": str(exc)})
+        if not result["found"]:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error",
+                         "detail": f"no query {request.query_id}: nothing was recorded"},
             )
         return JSONResponse(content={"ok": True, "replaced": result["replaced"]})
 
@@ -1141,6 +1422,9 @@ def create_app(engine: Engine | None = None, *, config_path: str = "config.toml"
             body["oracle_index_built_at"] = _iso(engine_.oracle_built_at)
             body["cards"] = getattr(engine_.name_index, "card_count", 0)
             body["oracle_stale"] = engine_.oracle_stale
+            body["oracle_chunks"] = (
+                len(engine_.oracle_search_index) if engine_.oracle_search_index is not None else None
+            )
         return JSONResponse(content=body)
 
     return app

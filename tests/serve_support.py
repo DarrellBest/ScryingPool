@@ -111,6 +111,13 @@ def config(db_path: str = ":memory:", art_dir: str = "art") -> Config:
         db_path=db_path,
         art_dir=art_dir,
         power_weights={"deck_count": 0.4, "price": 0.25, "cmc": 0.2, "cedh": 0.15},
+        # Deliberately a path that cannot exist, rather than leaving this at
+        # Config's own real-looking default ("data/oracle.db"): a test that
+        # forgets to stub `oracle_search_index_builder` must fail to open this
+        # file deterministically, everywhere, regardless of cwd or whether a
+        # real oracle.db happens to sit at the repo root — not silently read
+        # real production data one time and a missing file the next.
+        oracle_db_path="/nonexistent/scrying-pool-test/oracle.db",
     )
 
 
@@ -243,6 +250,120 @@ class StubBuilder:
         if self.indexes:
             return self.indexes.pop(0)
         return StubIndex(label=f"build-{self.calls}")
+
+
+@dataclass
+class StubOracleIndex:
+    """Only the surface `serve.api` actually reads off an OracleIndex."""
+
+    chunks: int = 94_812
+    cards: int = 32_726
+    dim: int = 768
+    build_seconds: float = 3.9
+    missing_embeddings: int = 0
+    label: str = "first"
+
+    def __len__(self) -> int:
+        return self.chunks
+
+    @property
+    def card_count(self) -> int:
+        return self.cards
+
+
+@dataclass
+class StubOracleSearchIndexBuilder:
+    """Stands in for `serve.api.build_oracle_search_index`."""
+
+    calls: int = 0
+    raises: BaseException | None = None
+    indexes: list = field(default_factory=list)
+
+    def __call__(self, cfg) -> StubOracleIndex:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        if self.indexes:
+            return self.indexes.pop(0)
+        return StubOracleIndex(label=f"build-{self.calls}")
+
+
+ORACLE_RESULT = {
+    "oracle_id": "o-verdant",
+    "name": "Verdant Genesis",
+    "mana_cost": "{2}{G}",
+    "type_line": "Enchantment",
+    "oracle_text": "Whenever a creature enters, draw a card.",
+    "cmc": 3.0,
+    "color_identity": "G",
+    "set_code": "abc",
+    "rarity": "rare",
+    "released_at": "2019-07-12",
+    "scryfall_uri": "https://scryfall.com/card/abc/1",
+    "legalities": {"commander": "legal"},
+    "fit": 0.87,
+    "rationale": "It draws a card whenever a creature enters.",
+    "chunk_ids": [7],
+    "matched_face_index": 0,
+    "matched_ordinal": 0,
+    "score": 0.5,
+    "stretch": False,
+    "judged": True,
+}
+
+ORACLE_OUTCOME = {
+    "query_id": 77,
+    "plan": {
+        "echo": 'filters: type = enchantment · colors ⊆ {G} (identity fits inside) · '
+                'mv ≤ 5 · semantic: "let me draw"',
+        "notes": [],
+        "scryfall_url": "https://scryfall.com/search?q=t%3Aenchantment",
+    },
+    "message": "214 cards passed the filters · 40 judged · 4 of 5 clear the 0.5 fit bar",
+    "results": [ORACLE_RESULT],
+    "pool": [ORACLE_RESULT],
+}
+
+
+def oracle_outcome(**plan_overrides) -> dict:
+    fresh = copy.deepcopy(ORACLE_OUTCOME)
+    fresh["plan"].update(copy.deepcopy(plan_overrides))
+    return fresh
+
+
+@dataclass
+class StubOracleSearch:
+    """A stand-in for `cts.oracle_search.execute`. Mirrors `StubSearch`."""
+
+    delay: float = 0.0
+    raises: BaseException | None = None
+    result: dict | None = None
+    calls: list[dict] = field(default_factory=list)
+    max_concurrent: int = 0
+    _live: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    started: threading.Event = field(default_factory=threading.Event)
+
+    def __call__(self, cfg, query, *, types=(), colors=None, mv_min=None, mv_max=None,
+                 legal=(), k=5, kind="user", conn=None, index=None, name_index=None) -> dict:
+        with self._lock:
+            self._live += 1
+            self.max_concurrent = max(self.max_concurrent, self._live)
+        self.started.set()
+        try:
+            self.calls.append(
+                {"query": query, "types": types, "colors": colors, "mv_min": mv_min,
+                 "mv_max": mv_max, "legal": legal, "k": k, "kind": kind, "conn": conn,
+                 "index": index, "name_index": name_index}
+            )
+            if self.delay:
+                time.sleep(self.delay)
+            if self.raises is not None:
+                raise self.raises
+            return copy.deepcopy(self.result) if self.result is not None else oracle_outcome()
+        finally:
+            with self._lock:
+                self._live -= 1
 
 
 def ollama_ok(loaded=("judge-model",)) -> dict:

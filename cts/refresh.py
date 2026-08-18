@@ -88,7 +88,7 @@ def run(cfg: Config) -> int:
     # Stage modules are imported here rather than at module scope so that a
     # module which is missing or fails to import reports itself as a named
     # stage failure instead of breaking `python -m cts` entirely.
-    from . import art, describe, edhrec, embed, ingest, oracle_ingest, power
+    from . import art, describe, edhrec, embed, ingest, oracle_chunk, oracle_embed, oracle_ingest, power
 
     stages: list[tuple[str, str, object]] = [
         # 1. Bulk data. ingest.run compares the bulk-data updated_at against the
@@ -145,9 +145,19 @@ def run(cfg: Config) -> int:
         #    EDHREC at 1 req/s, this is noise.
         ("oracle-ingest", "oracle corpus: scryfall oracle_cards bulk",
          lambda: oracle_ingest.run(cfg)),
-        # 7-8. oracle-chunk and oracle-embed append here, after this stage, when
-        #      the semantic half of /oracle lands. /search needs neither: `cards`
-        #      and `card_faces` alone are enough to resolve a name.
+        # 7. Re-chunk exactly what oracle-ingest says moved: cards with no
+        #    chunks at all (new cards — oracle_chunk.rechunk picks these up on
+        #    its own) plus `changed_text` (Wizards errata / templating
+        #    updates). `results` is the same dict this loop populates as it
+        #    runs, so by the time this lambda is CALLED (not when the list is
+        #    built) `results["oracle-ingest"]` already holds this run's answer.
+        ("oracle-chunk", "oracle corpus: re-chunk cards whose oracle_text changed",
+         lambda: oracle_chunk.run(cfg, results.get("oracle-ingest", {}).get("changed_text") or [])),
+        # 8. Embed chunks with no vector yet — new cards' chunks, and any
+        #    re-chunked card's chunks, which stage 7 deleted along with their
+        #    stale embeddings.
+        ("oracle-embed", "oracle corpus: embed chunks with no vector",
+         lambda: oracle_embed.run(cfg)),
     ]
 
     results: dict[str, dict] = {}
@@ -190,6 +200,9 @@ def run(cfg: Config) -> int:
     oracle_cards = int(oracle.get("cards") or 0)
     oracle_new = len(oracle.get("new_cards") or [])
     oracle_changed = len(oracle.get("changed_text") or [])
+    oracle_chunked = int(results.get("oracle-chunk", {}).get("cards") or 0)
+    oracle_chunks = int(results.get("oracle-chunk", {}).get("chunks") or 0)
+    oracle_embedded = int(results.get("oracle-embed", {}).get("embedded") or 0)
 
     rule = "=" * 66
     print()
@@ -216,6 +229,8 @@ def run(cfg: Config) -> int:
         + (f", {oracle_new} new" if oracle_new else "")
         + (f", {oracle_changed} with changed oracle text" if oracle_changed else "")
     )
+    print(f"  oracle chunks      {oracle_chunked} card(s) (re)chunked, {oracle_chunks} chunk rows")
+    print(f"  oracle embeddings  {oracle_embedded} chunks embedded")
     print("  indexes            rebuilt on next load (BM25 + matrix are built at load time)")
     print(f"  total runtime      {_fmt_duration(elapsed)}")
     print(rule)

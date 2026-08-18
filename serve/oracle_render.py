@@ -336,3 +336,265 @@ def corpus_missing_message() -> str:
         "The oracle corpus hasn't been built on the host yet. Someone needs to run "
         "`python -m cts oracle-ingest`."
     )
+
+
+# ===========================================================================
+# /oracle — ranked mechanical results
+#
+# Same rules as the rest of this module: pure functions, plain dicts, stdlib
+# only. Two decisions worth restating here rather than leaving implicit:
+#
+# * **No image, no thumbnail, ever.** A picture would invite the reader to
+#   judge a ranked MECHANICAL result on its art, and the whole feature exists
+#   to separate those two questions. `oracle_result_embed`'s own test asserts
+#   the embed dict never grows an "image" or "thumbnail" key.
+# * **The full oracle text goes first, verbatim, above the rationale** — a
+#   deliberate inversion of `/scry`'s embed, where the model-written rationale
+#   leads. Here the evidence is authoritative (Wizards' own text) and the
+#   rationale is the only model-written thing on screen, so the authoritative
+#   text goes first and the claim about it goes second. A loot-for-draw error
+#   is then checkable in the two seconds it takes to read the card.
+# ===========================================================================
+
+COLOR_ORACLE_PASS = 0x2ECC71     # clears the 0.5 fit bar
+COLOR_ORACLE_STRETCH = 0x95A5A6  # below it — same grey as /scry's stretch colour
+
+# Deliberately much shorter than /search's MAX_DESCRIPTION: a ranked result is
+# one of up to five in a message, not the sole point of the reply, and the
+# design doc specifies 700 as the truncation point with a pointer to the full
+# text on Scryfall (the embed's own `url`) rather than a 4,000-character wall.
+MAX_RESULT_DESCRIPTION = 700
+
+MAX_EMBEDS = 5  # k is capped at 5 by both the API and the Discord command
+
+ORACLE_LEGALITY_FORMATS = ("standard", "pioneer", "modern", "legacy", "vintage", "commander")
+
+# A note is a warning when it says a stage of the pipeline did not run, same
+# convention `serve/render.py::_is_warning` already established for /scry.
+_WARNING_MARKERS = ("unavailable", "unreachable", "failed", "fell back", "no embedding")
+
+
+def _is_warning(note: str) -> bool:
+    lowered = note.lower()
+    return any(marker in lowered for marker in _WARNING_MARKERS)
+
+
+def _mark_matched_line(oracle_text: str, face_index: Any, ordinal: Any) -> str:
+    """Prefix the matched ability's line with "▸ ", located by `ordinal`
+    (position among non-blank lines within its face) — never by string
+    search, which could mark the wrong occurrence of a repeated line.
+
+    `ordinal` of -1 (the whole-card chunk matched, not one ability) or None
+    (no retrieval ran — the structural-only fast path) marks nothing.
+    """
+    text = str(oracle_text or "")
+    try:
+        target_face = int(face_index)
+        target_ordinal = int(ordinal)
+    except (TypeError, ValueError):
+        return text
+    if target_ordinal < 0:
+        return text
+
+    faces = text.split("\n//\n")
+    marked_faces = []
+    for face_i, face_text in enumerate(faces):
+        if face_i != target_face:
+            marked_faces.append(face_text)
+            continue
+        counter = 0
+        out_lines = []
+        for line in face_text.split("\n"):
+            if line.strip():
+                prefix = "▸ " if counter == target_ordinal else "  "
+                out_lines.append(prefix + line)
+                counter += 1
+            else:
+                out_lines.append(line)
+        marked_faces.append("\n".join(out_lines))
+    return "\n//\n".join(marked_faces)
+
+
+def oracle_result_description(result: dict) -> str:
+    """Full oracle text, verbatim, marked and truncated. See the module note
+    on why full text leads and the rationale trails."""
+    text = str(result.get("oracle_text") or "").strip()
+    if not text:
+        return "_(no rules text)_"
+    marked = _mark_matched_line(text, result.get("matched_face_index"), result.get("matched_ordinal"))
+    truncated = len(marked) > MAX_RESULT_DESCRIPTION
+    body = "```\n" + _truncate(marked, MAX_RESULT_DESCRIPTION - 10) + "\n```"
+    if truncated:
+        body += "\n_(truncated — the full text is one click away, on Scryfall)_"
+    return body
+
+
+def oracle_legality_line(legalities: dict | None) -> str:
+    """Up to six major formats where the card is legal, plus any bans among
+    them named explicitly — a banned card is not "not legal" in the same way
+    an unreleased one is."""
+    if not isinstance(legalities, dict) or not legalities:
+        return "unknown"
+    legal = [f for f in ORACLE_LEGALITY_FORMATS if legalities.get(f) == "legal"][:6]
+    banned = [f for f in ORACLE_LEGALITY_FORMATS if legalities.get(f) == "banned"]
+    parts = [", ".join(legal) if legal else "not legal in the major formats"]
+    if banned:
+        parts.append("Banned in " + ", ".join(banned))
+    return " · ".join(parts)
+
+
+def _oracle_footer(result: dict) -> str:
+    set_code = result.get("set_code")
+    if not set_code:
+        return ""
+    released = str(result.get("released_at") or "")
+    year = released[:4] if released[:4].isdigit() else ""
+    label = f"first printed {str(set_code).upper()}"
+    return f"{label} {year}".strip()
+
+
+def oracle_result_embed(result: dict, position: int) -> dict:
+    """One `/oracle` result -> one Discord embed dict."""
+    stretch = bool(result.get("stretch"))
+    name = str(result.get("name") or "unknown card")
+    mana = str(result.get("mana_cost") or "").strip()
+    title = f"{name} {mana}".strip() if mana else name
+    if stretch:
+        title += " · STRETCH"
+
+    cmc = result.get("cmc")
+    try:
+        cmc_text = f"{float(cmc):g}"
+    except (TypeError, ValueError):
+        cmc_text = "?"
+    colors = str(result.get("color_identity") or "").strip().upper() or "C"
+
+    fit = result.get("fit")
+    fit_text = "—" if fit is None else f"{float(fit):.2f}"
+
+    fields: list[dict] = [
+        {"name": "Type", "value": _truncate(str(result.get("type_line") or "—"), MAX_FIELD_VALUE),
+         "inline": True},
+        {"name": "Mana value / Colours", "value": f"{cmc_text} / {colors}", "inline": True},
+        {"name": "Fit", "value": fit_text, "inline": True},
+        {"name": "Legal", "value": _truncate(oracle_legality_line(result.get("legalities")),
+                                              MAX_FIELD_VALUE), "inline": False},
+    ]
+    if result.get("rationale"):
+        fields.append({"name": "Rationale",
+                        "value": _truncate(str(result["rationale"]), MAX_FIELD_VALUE),
+                        "inline": False})
+
+    embed: dict = {
+        "title": _truncate(title, MAX_TITLE),
+        "color": COLOR_ORACLE_STRETCH if stretch else COLOR_ORACLE_PASS,
+        "description": oracle_result_description(result),
+        "fields": fields,
+    }
+    if result.get("scryfall_uri"):
+        embed["url"] = str(result["scryfall_uri"])
+    footer = _oracle_footer(result)
+    if footer:
+        embed["footer"] = {"text": _truncate(footer, MAX_FOOTER)}
+    # No "image" key, no "thumbnail" key — ever. See the module note above;
+    # tests/test_oracle_render.py asserts this directly rather than trusting
+    # that nothing here ever adds one.
+    return embed
+
+
+def oracle_content_line(query: str, outcome: dict) -> str:
+    """The text above the embeds: header, echoed filters, the honest counts,
+    any notes, and the Scryfall refine link — in that order, every time."""
+    plan = outcome.get("plan") or {}
+    lines = [f'🔮 "{query}"']
+    if plan.get("echo"):
+        lines.append(str(plan["echo"]))
+    if outcome.get("message"):
+        lines.append(str(outcome["message"]))
+    for note in plan.get("notes") or []:
+        note = str(note)
+        lines.append(f"⚠️ {note}" if _is_warning(note) else f"note: {note}")
+    if plan.get("scryfall_url"):
+        lines.append(f"[refine on Scryfall]({plan['scryfall_url']})")
+    return _truncate("\n".join(lines), MAX_CONTENT)
+
+
+def oracle_message(query: str, outcome: dict) -> dict:
+    """`execute()`'s outcome dict -> `{"content": str, "embeds": [dict, ...]}`.
+
+    A guard response (card-name or rules-question) is content-only — there is
+    nothing to rank and nothing to embed."""
+    if outcome.get("guard"):
+        return {"content": _truncate(str(outcome.get("message") or ""), MAX_CONTENT), "embeds": []}
+
+    results = (outcome.get("results") or [])[:MAX_EMBEDS]
+    return {
+        "content": oracle_content_line(query, outcome),
+        "embeds": [oracle_result_embed(r, i) for i, r in enumerate(results, start=1)],
+    }
+
+
+# --------------------------------------------------------------- feedback buttons
+
+# A distinct prefix from /scry's "sp:v1" so serve/render.py's decode_custom_id
+# and this one can never claim each other's buttons — carries oracle_id, a
+# UUID, rather than illustration_id, but the same length margin against
+# Discord's 100-character limit applies.
+ORACLE_CUSTOM_ID_PREFIX = "sp:o1"
+MAX_ORACLE_CUSTOM_ID = 100
+
+
+def encode_oracle_custom_id(query_id: int | str, oracle_id: str, accepted: bool) -> str:
+    vote = "u" if accepted else "d"
+    custom_id = f"{ORACLE_CUSTOM_ID_PREFIX}:{query_id}:{oracle_id}:{vote}"
+    if len(custom_id) > MAX_ORACLE_CUSTOM_ID:
+        raise ValueError(
+            f"custom_id is {len(custom_id)} characters, over Discord's "
+            f"{MAX_ORACLE_CUSTOM_ID}: {custom_id!r}"
+        )
+    return custom_id
+
+
+def decode_oracle_custom_id(custom_id: str) -> tuple[int, str, bool] | None:
+    parts = str(custom_id).split(":")
+    if len(parts) != 5:
+        return None
+    namespace, version, raw_query_id, oracle_id, vote = parts
+    if (namespace, version) != tuple(ORACLE_CUSTOM_ID_PREFIX.split(":")):
+        return None
+    if vote not in ("u", "d") or not oracle_id:
+        return None
+    try:
+        query_id = int(raw_query_id)
+    except ValueError:
+        return None
+    return query_id, oracle_id, vote == "u"
+
+
+def oracle_button_specs(outcome: dict) -> list[dict]:
+    """Ten button descriptors in embed order, mirroring `render.button_specs`."""
+    query_id = outcome.get("query_id")
+    if query_id is None:
+        return []
+    results = (outcome.get("results") or [])[:MAX_EMBEDS]
+    specs: list[dict] = []
+    for accepted, emoji in ((True, "👍"), (False, "👎")):
+        for position, result in enumerate(results, start=1):
+            oracle_id = result.get("oracle_id")
+            if not oracle_id:
+                continue
+            try:
+                custom_id = encode_oracle_custom_id(query_id, str(oracle_id), accepted)
+            except ValueError:
+                continue
+            specs.append(
+                {
+                    "custom_id": custom_id,
+                    "label": str(position),
+                    "emoji": emoji,
+                    "row": 0 if accepted else 1,
+                    "accepted": accepted,
+                    "name": str(result.get("name") or "that result"),
+                }
+            )
+    return specs

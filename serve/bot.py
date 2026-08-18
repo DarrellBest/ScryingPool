@@ -88,6 +88,11 @@ WUBRG = "WUBRG"
 # `[^:]+` cannot swallow the trailing vote character.
 CUSTOM_ID_TEMPLATE = r"sp:v1:(?P<query_id>\d+):(?P<illustration_id>[^:]+):(?P<vote>[ud])"
 
+# The /oracle analogue, one version namespace over — "sp:o1" rather than
+# "sp:v1" — so this template and the one above can never match each other's
+# component ids even though both start with "sp:" and both end in a UUID.
+ORACLE_CUSTOM_ID_TEMPLATE = r"sp:o1:(?P<query_id>\d+):(?P<oracle_id>[^:]+):(?P<vote>[ud])"
+
 
 def api_base() -> str:
     return os.environ.get(API_URL_ENV, DEFAULT_API_URL).rstrip("/")
@@ -218,6 +223,118 @@ def build_view(outcome: dict) -> discord.ui.View | None:
     for spec in specs:
         view.add_item(
             FeedbackButton(
+                int(outcome["query_id"]),
+                spec["custom_id"].split(":")[3],
+                spec["accepted"],
+                label=spec["label"],
+                emoji=spec["emoji"],
+                row=spec["row"],
+                name=spec["name"],
+            )
+        )
+    return view
+
+
+class OracleFeedbackButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=ORACLE_CUSTOM_ID_TEMPLATE,
+):
+    """The `/oracle` analogue of `FeedbackButton`. A distinct class matched
+    against a distinct template (`sp:o1:...`), so a component id from one
+    family is never mistaken for the other's — discord.py tries each
+    registered `DynamicItem` template in turn, and a `/scry` button and an
+    `/oracle` button sitting in the same channel must resolve to the right
+    one every time, not whichever class happened to match first."""
+
+    def __init__(
+        self, query_id: int, oracle_id: str, accepted: bool, *,
+        label: str = "", emoji: str | None = None, row: int = 0, name: str = "that result",
+    ) -> None:
+        self.query_id = query_id
+        self.oracle_id = oracle_id
+        self.accepted = accepted
+        self.name = name
+        super().__init__(
+            discord.ui.Button(
+                label=label or None, emoji=emoji, style=discord.ButtonStyle.secondary,
+                custom_id=oracle_render.encode_oracle_custom_id(query_id, oracle_id, accepted),
+                row=row,
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(          # type: ignore[override]
+        cls, interaction: discord.Interaction, item: discord.ui.Button, match: "re.Match[str]", /,
+    ) -> "OracleFeedbackButton":
+        return cls(
+            int(match["query_id"]), match["oracle_id"], match["vote"] == "u",
+            label=item.label or "", emoji=str(item.emoji) if item.emoji else None,
+            row=item.row or 0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        verdict = "👍" if self.accepted else "👎"
+        try:
+            async with httpx.AsyncClient(timeout=FEEDBACK_TIMEOUT) as client:
+                response = await client.post(
+                    f"{api_base()}/oracle/feedback",
+                    json={
+                        "query_id": self.query_id,
+                        "oracle_id": self.oracle_id,
+                        "accepted": self.accepted,
+                        "discord_user_id": str(interaction.user.id),
+                    },
+                )
+        except httpx.HTTPError as exc:
+            log.warning(
+                "oracle feedback failed for query_id=%s oracle_id=%s: %s",
+                self.query_id, self.oracle_id, exc,
+            )
+            await interaction.followup.send(
+                "Couldn't record that — the search service isn't answering.", ephemeral=True
+            )
+            return
+
+        if response.status_code == 404:
+            await interaction.followup.send(
+                "Couldn't record that: this result is older than the current database.",
+                ephemeral=True,
+            )
+            return
+        if response.status_code >= 400:
+            log.warning(
+                "oracle feedback %s for query_id=%s: %s",
+                response.status_code, self.query_id, response.text[:200],
+            )
+            await interaction.followup.send("Couldn't record that.", ephemeral=True)
+            return
+
+        name = self.name
+        message = interaction.message
+        if message and message.embeds:
+            position = None
+            try:
+                position = int(str(self.item.label))
+            except (TypeError, ValueError):
+                position = None
+            if position and 1 <= position <= len(message.embeds):
+                title = message.embeds[position - 1].title or ""
+                stripped = title.split(" · STRETCH")[0]
+                name = stripped.rsplit(" {", 1)[0].strip() or stripped or name
+
+        await interaction.followup.send(f"recorded {verdict} for {name}", ephemeral=True)
+
+
+def build_oracle_view(outcome: dict) -> discord.ui.View | None:
+    """The `/oracle` analogue of `build_view`."""
+    specs = oracle_render.oracle_button_specs(outcome)
+    if not specs:
+        return None
+    view = discord.ui.View(timeout=None)
+    for spec in specs:
+        view.add_item(
+            OracleFeedbackButton(
                 int(outcome["query_id"]),
                 spec["custom_id"].split(":")[3],
                 spec["accepted"],
@@ -382,6 +499,109 @@ async def run_scry(
         )
 
 
+async def run_oracle(
+    interaction: discord.Interaction,
+    query: str,
+    k: int,
+    types: str | None,
+    colors: str | None,
+    mv_min: int | None,
+    mv_max: int | None,
+    legal: str | None,
+) -> None:
+    """Defer, placeholder, POST /oracle/search, edit in place — the same
+    shape `run_scry` uses, over a different endpoint. `/oracle` shares
+    `/scry`'s queue and lock server-side (see `Engine.oracle_search`), so the
+    same placeholder-from-/health and the same generous timeout apply: a
+    search queued behind an 80-second `/scry` is a real, expected wait, not a
+    failure to explain differently.
+    """
+    async with httpx.AsyncClient() as client:
+        health, api_down = await fetch_health(client)
+        if api_down:
+            await _edit(interaction, content=render.api_down_message())
+            return
+
+        await _edit(interaction, content=render.placeholder(health))
+
+        refreshing = ((health or {}).get("refresh") or {}).get("running") is True
+        timeout = SEARCH_TIMEOUT_REFRESHING if refreshing else SEARCH_TIMEOUT
+
+        payload: dict[str, Any] = {"query": query, "k": k}
+        if types:
+            payload["types"] = [t.strip() for t in types.split(",") if t.strip()]
+        if colors:
+            payload["colors"] = colors
+        if mv_min is not None:
+            payload["mv_min"] = mv_min
+        if mv_max is not None:
+            payload["mv_max"] = mv_max
+        if legal:
+            payload["legal"] = [f.strip() for f in legal.split(",") if f.strip()]
+
+        try:
+            response = await client.post(
+                f"{api_base()}/oracle/search", json=payload, timeout=timeout
+            )
+        except httpx.ConnectError:
+            await _edit(interaction, content=render.api_down_message())
+            return
+        except httpx.ReadTimeout:
+            log.warning("oracle search timed out after %.0fs for query=%r", timeout, query)
+            await _edit(interaction, content=render.timeout_message(timeout))
+            return
+        except httpx.HTTPError as exc:
+            log.warning("oracle search transport error: %s", exc)
+            await _edit(
+                interaction, content=render.search_failed_message(f"transport error: {exc}")
+            )
+            return
+
+    if response.status_code == 503:
+        body = _json_or_none(response)
+        if (body or {}).get("status") == "unavailable":
+            await _edit(interaction, content=oracle_render.corpus_missing_message())
+        else:
+            await _edit(interaction, content=render.busy_message(body))
+        return
+    if response.status_code == 422:
+        detail = (_json_or_none(response) or {}).get("detail")
+        await _edit(
+            interaction,
+            content="That search wasn't valid: check `k` is 1-5, `mv_min`/`mv_max` are "
+            f"0-30 with min not above max, and `colors` is a subset of WUBRG."
+            + (f" ({detail})" if detail else ""),
+        )
+        return
+    if response.status_code >= 400:
+        detail = (_json_or_none(response) or {}).get("detail") or response.text[:300]
+        await _edit(interaction, content=render.search_failed_message(str(detail)))
+        return
+
+    outcome = _json_or_none(response)
+    if outcome is None:
+        await _edit(
+            interaction,
+            content=render.search_failed_message("the API returned something that wasn't JSON"),
+        )
+        return
+
+    message = oracle_render.oracle_message(query, outcome)
+    embeds = [discord.Embed.from_dict(e) for e in message["embeds"]]
+    view = build_oracle_view(outcome)
+
+    kwargs: dict[str, Any] = {"content": message["content"], "embeds": embeds}
+    if view is not None:
+        kwargs["view"] = view
+
+    if not await _edit(interaction, **kwargs):
+        log.warning(
+            "could not deliver oracle results for query_id=%s — they are durable in the "
+            "oracle database and recoverable by that id",
+            outcome.get("query_id"),
+        )
+
+
 async def fetch_card(name: str) -> tuple[int, dict | None]:
     """`GET /card?name=…`. Returns (status, body) and never raises.
 
@@ -492,8 +712,10 @@ class ScryingBot(discord.Client):
 
     async def setup_hook(self) -> None:
         # Registered before login completes, so a button tapped in the first
-        # second after a restart already resolves.
-        self.add_dynamic_items(FeedbackButton)
+        # second after a restart already resolves. Two distinct classes, two
+        # distinct templates (sp:v1 / sp:o1) — see OracleFeedbackButton's
+        # docstring for why that separation matters.
+        self.add_dynamic_items(FeedbackButton, OracleFeedbackButton)
 
         plan = sync_plan(self.guild_id, self.allow_global_sync)
         if plan == "guild":
@@ -598,6 +820,50 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             await run_scry(interaction, theme.strip(), k, band, normalized)
         except Exception as exc:                     # noqa: BLE001 - never a dead spinner
             log.exception("unhandled error in /scry")
+            await _edit(
+                interaction,
+                content=render.search_failed_message(f"{type(exc).__name__}: {exc}"),
+            )
+
+    @tree.command(
+        name="oracle",
+        description="Find cards by what their RULES TEXT does — not a rules Q&A.",
+    )
+    @app_commands.describe(
+        query="What the card should DO, in your own words (e.g. \"let me draw and cost 5 or less\").",
+        types="Card types, comma-separated (e.g. enchantment,artifact). Matches ANY of them.",
+        colors="Colour identity filter, e.g. WUB — the card's identity must fit inside this set.",
+        mv_min="Minimum mana value, inclusive.",
+        mv_max="Maximum mana value, inclusive.",
+        legal="Formats, comma-separated (e.g. commander,pauper). Matches ANY of them.",
+        k="How many results (1-5, default 5).",
+    )
+    async def oracle(
+        interaction: discord.Interaction,
+        query: app_commands.Range[str, 1, 300],
+        types: str | None = None,
+        colors: str | None = None,
+        mv_min: app_commands.Range[int, 0, 30] | None = None,
+        mv_max: app_commands.Range[int, 0, 30] | None = None,
+        legal: str | None = None,
+        k: app_commands.Range[int, 1, 5] = 5,
+    ) -> None:
+        # FIRST, before anything else — same reasoning as /scry: /health is
+        # already outside the 3-second acknowledgement window.
+        await interaction.response.defer(thinking=True)
+
+        try:
+            normalized = normalize_colors(colors)
+        except ValueError as exc:
+            await _edit(interaction, content=str(exc))
+            return
+
+        try:
+            await run_oracle(
+                interaction, query.strip(), k, types, normalized, mv_min, mv_max, legal,
+            )
+        except Exception as exc:                     # noqa: BLE001 - never a dead spinner
+            log.exception("unhandled error in /oracle")
             await _edit(
                 interaction,
                 content=render.search_failed_message(f"{type(exc).__name__}: {exc}"),

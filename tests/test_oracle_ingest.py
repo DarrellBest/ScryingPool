@@ -483,6 +483,73 @@ def test_the_weekly_refresh_runs_oracle_ingest_and_runs_it_last(monkeypatch, tmp
     assert order == ["ingest", "edhrec", "power", "art", "describe", "embed", "oracle-ingest"]
 
 
+def test_stages_7_and_8_run_oracle_chunk_then_oracle_embed_after_ingest(monkeypatch, tmp_path):
+    """Stages 7-8, appended after oracle-ingest (stage 6), in that order —
+    re-chunking whatever oracle-ingest's own `changed_text` names, then
+    embedding whatever chunk left with no vector."""
+    from cts import art, describe, edhrec, embed, ingest, oracle_chunk, oracle_embed, power, refresh
+
+    order: list[str] = []
+
+    def stub(name, result=None):
+        def run(*args, **kwargs):
+            order.append(name)
+            return result or {}
+        return run
+
+    cfg = _cfg(tmp_path)
+    conn = oracle_db.connect(cfg)
+    oracle_ingest.write(conn, [SOL_RING])
+    conn.close()
+
+    monkeypatch.setattr(refresh, "_preflight", lambda cfg: None)
+    monkeypatch.setattr(ingest, "run", stub("ingest", {"new_cards": [], "new_arts": 0}))
+    monkeypatch.setattr(edhrec, "run", stub("edhrec"))
+    monkeypatch.setattr(power, "run", stub("power"))
+    monkeypatch.setattr(art, "run", stub("art"))
+    monkeypatch.setattr(describe, "run", stub("describe"))
+    monkeypatch.setattr(embed, "run", stub("embed"))
+
+    seen_changed_ids: list = []
+
+    def fake_ingest_run(cfg, force=False):
+        order.append("oracle-ingest")
+        return {"cards": 1, "new_cards": [], "changed_text": [SOL_RING["oracle_id"]], "removed": []}
+
+    monkeypatch.setattr(oracle_ingest, "run", fake_ingest_run)
+
+    real_chunk_run = oracle_chunk.run
+
+    def spying_chunk_run(cfg, changed_ids=()):
+        order.append("oracle-chunk")
+        seen_changed_ids.extend(changed_ids)
+        return real_chunk_run(cfg, changed_ids)
+
+    monkeypatch.setattr(oracle_chunk, "run", spying_chunk_run)
+
+    real_embed_run = oracle_embed.run
+
+    def spying_embed_run(cfg):
+        order.append("oracle-embed")
+        return real_embed_run(cfg)
+
+    monkeypatch.setattr(oracle_embed, "run", spying_embed_run)
+
+    assert refresh.run(cfg) == 0
+    assert order[-3:] == ["oracle-ingest", "oracle-chunk", "oracle-embed"]
+    assert seen_changed_ids == [SOL_RING["oracle_id"]]
+
+    conn = oracle_db.connect(cfg)
+    try:
+        # Sol Ring had no chunks before this refresh (never chunked in this
+        # test), so it lands in oracle_chunk's own "never chunked" selector
+        # regardless of changed_ids — the real assertion is that the stage ran
+        # and produced chunks at all.
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
 def test_a_failing_oracle_stage_does_not_undo_the_art_stages(monkeypatch, tmp_path):
     from cts import art, describe, edhrec, embed, ingest, oracle_ingest as oi, power, refresh
 

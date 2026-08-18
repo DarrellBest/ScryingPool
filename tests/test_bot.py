@@ -57,6 +57,37 @@ def test_bot_template_ignores_foreign_component_ids(foreign):
     assert re.compile(bot.CUSTOM_ID_TEMPLATE).fullmatch(foreign) is None
 
 
+# --------------------------------------------------------- the /oracle custom_id seam
+
+
+def test_oracle_bot_template_matches_every_id_oracle_render_can_emit():
+    from serve import oracle_render
+
+    pattern = re.compile(bot.ORACLE_CUSTOM_ID_TEMPLATE)
+    for query_id in (1, 4210, 999999999):
+        for accepted in (True, False):
+            custom_id = oracle_render.encode_oracle_custom_id(query_id, "o-verdant", accepted)
+            match = pattern.fullmatch(custom_id)
+            assert match is not None, custom_id
+            assert int(match["query_id"]) == query_id
+            assert match["oracle_id"] == "o-verdant"
+            assert (match["vote"] == "u") is accepted
+
+
+def test_the_scry_prefix_never_decodes_as_the_oracle_prefix_and_vice_versa():
+    """A real collision risk: both button families can sit in the same
+    channel, and discord.py tries every registered DynamicItem template in
+    turn — a scry button matching the oracle template (or vice versa) would
+    silently record the wrong kind of feedback."""
+    from serve import oracle_render
+
+    scry_id = render.encode_custom_id(1, "ill-avacyn", True)
+    oracle_id = oracle_render.encode_oracle_custom_id(1, "o-verdant", True)
+
+    assert re.compile(bot.ORACLE_CUSTOM_ID_TEMPLATE).fullmatch(scry_id) is None
+    assert re.compile(bot.CUSTOM_ID_TEMPLATE).fullmatch(oracle_id) is None
+
+
 # ------------------------------------------------------------------- colour validation
 
 
@@ -473,6 +504,51 @@ def test_both_commands_are_registered_and_named_for_the_question_they_answer():
     assert {"scry", "search"} <= names
     assert "NAME" in _registered(tree, "search").description
     assert "ARTWORK" in _registered(tree, "scry").description
+
+
+def test_oracle_command_is_registered_and_distinguishes_itself_from_scry():
+    tree = _build_tree()
+    names = {command.name for command in tree.get_commands()}
+    assert {"scry", "search", "oracle"} <= names
+    description = _registered(tree, "oracle").description
+    assert "RULES TEXT" in description
+    assert "not a rules Q&A" in description
+
+
+# ------------------------------------------------------------------- /oracle buttons
+
+
+def _oracle_outcome(**overrides) -> dict:
+    base = {
+        "query_id": 42,
+        "results": [
+            {"oracle_id": "o-verdant", "name": "Verdant Genesis", "fit": 0.9, "stretch": False},
+        ],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_build_oracle_view_makes_two_persistent_buttons_for_one_result():
+    view = bot.build_oracle_view(_oracle_outcome())
+    assert view is not None
+    assert len(view.children) == 2   # one 👍, one 👎
+
+
+def test_build_oracle_view_is_none_when_there_is_nothing_to_vote_on():
+    assert bot.build_oracle_view(_oracle_outcome(results=[])) is None
+    assert bot.build_oracle_view(_oracle_outcome(query_id=None)) is None
+
+
+def test_build_oracle_view_buttons_carry_oracle_ids_not_illustration_ids():
+    from serve import oracle_render
+
+    view = bot.build_oracle_view(_oracle_outcome())
+    custom_ids = [child.custom_id for child in view.children]
+    for custom_id in custom_ids:
+        decoded = oracle_render.decode_oracle_custom_id(custom_id)
+        assert decoded is not None
+        assert decoded[1] == "o-verdant"
 
 
 def test_search_answers_without_deferring(monkeypatch):

@@ -51,9 +51,38 @@ def _search(cfg: Config, args: argparse.Namespace) -> None:
 
 
 def _oracle_ingest(cfg: Config, args: argparse.Namespace) -> None:
+    from .oracle_chunk import run as run_oracle_chunk
     from .oracle_ingest import run as run_oracle_ingest
 
-    run_oracle_ingest(cfg, force=args.force)
+    result = run_oracle_ingest(cfg, force=args.force)
+    # Bundled here rather than a separate CLI command: a re-chunk only ever
+    # needs the set of oracle_ids ingest just told us moved (new cards have no
+    # chunks yet and are picked up automatically; changed_text cards are
+    # rechunked explicitly) — running it standalone would need that same list
+    # from somewhere else.
+    run_oracle_chunk(cfg, result.get("changed_text") or [])
+
+
+def _oracle_embed(cfg: Config, args: argparse.Namespace) -> None:
+    from .oracle_embed import run as run_oracle_embed
+
+    run_oracle_embed(cfg)
+
+
+def _oracle(cfg: Config, args: argparse.Namespace) -> None:
+    from .oracle_search import run as run_oracle_search
+
+    run_oracle_search(
+        cfg,
+        args.query,
+        types=tuple(args.types.split(",")) if args.types else (),
+        colors=args.colors,
+        mv_min=args.mv_min,
+        mv_max=args.mv_max,
+        legal=tuple(args.legal.split(",")) if args.legal else (),
+        k=args.k,
+        as_json=args.as_json,
+    )
 
 
 def _refresh(cfg: Config, args: argparse.Namespace) -> None:
@@ -156,10 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "oracle-ingest",
-        help="oracle corpus: Scryfall oracle_cards bulk -> cards/faces/types/legalities",
+        help="oracle corpus: Scryfall oracle_cards bulk -> cards/faces/types/legalities + chunk",
         description="Build the oracle corpus in its own database (oracle_db_path), one "
-        "row per Oracle ID for every paper card. Never touches the art corpus. "
-        "Idempotent: skips the download when Scryfall's bulk file has not moved.",
+        "row per Oracle ID for every paper card, then chunk every new or "
+        "changed-text card. Never touches the art corpus. Idempotent: skips "
+        "the download when Scryfall's bulk file has not moved.",
     )
     p.add_argument(
         "--force",
@@ -167,6 +197,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-download and re-parse even when the bulk file has not changed",
     )
     p.set_defaults(handler=_oracle_ingest)
+
+    p = sub.add_parser(
+        "oracle-embed",
+        help="oracle corpus: embed chunks with no vector",
+        description="Embed every oracle chunk that has no chunk_embeddings row yet, "
+        "on text_embedded. Idempotent and resumable.",
+    )
+    p.set_defaults(handler=_oracle_embed)
+
+    p = sub.add_parser(
+        "oracle",
+        help="/oracle: search cards by what their rules text does",
+        description="Route, expand, retrieve, filter, judge, and print — a natural "
+        "language search over Oracle text, with structured filters in SQL.",
+    )
+    p.add_argument("query", metavar="QUERY", help="free-text mechanical query, in quotes")
+    p.add_argument("--types", default=None, metavar="T1,T2", help="comma-separated card types (UNION)")
+    p.add_argument("--colors", default=None, metavar="WUBRG",
+                    help="colour identity filter: card's identity must fit inside this set")
+    p.add_argument("--mv-min", type=int, default=None, metavar="N", help="minimum mana value, inclusive")
+    p.add_argument("--mv-max", type=int, default=None, metavar="N", help="maximum mana value, inclusive")
+    p.add_argument("--legal", default=None, metavar="F1,F2", help="comma-separated formats (UNION)")
+    p.add_argument("-k", "--k", type=int, default=5, metavar="N", help="results to return (default: 5)")
+    p.add_argument("--json", dest="as_json", action="store_true", help="emit the full pool as JSON")
+    p.set_defaults(handler=_oracle)
 
     p = sub.add_parser(
         "refresh",
