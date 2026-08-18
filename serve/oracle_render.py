@@ -504,7 +504,8 @@ def oracle_result_embed(result: dict, position: int) -> dict:
 
 def oracle_content_line(query: str, outcome: dict) -> str:
     """The text above the embeds: header, echoed filters, the honest counts,
-    any notes, and the Scryfall refine link — in that order, every time."""
+    any notes, any ignored (unenforceable, set-level) constraints, and the
+    Scryfall refine link — in that order, every time."""
     plan = outcome.get("plan") or {}
     lines = [f'🔮 "{query}"']
     if plan.get("echo"):
@@ -514,6 +515,15 @@ def oracle_content_line(query: str, outcome: dict) -> str:
     for note in plan.get("notes") or []:
         note = str(note)
         lines.append(f"⚠️ {note}" if _is_warning(note) else f"note: {note}")
+    for clause in plan.get("ignored") or []:
+        # A constraint the router recognised but this pipeline cannot express
+        # — a relationship between the returned cards, not a property of one
+        # card (e.g. "no overlapping color identity"). Named here rather than
+        # silently vanishing into "semantic: none" — see Defect 3.
+        lines.append(
+            f"ignored: {clause} (cards are judged independently; a constraint "
+            "across the result set can't be enforced)"
+        )
     if plan.get("scryfall_url"):
         lines.append(f"[refine on Scryfall]({plan['scryfall_url']})")
     return _truncate("\n".join(lines), MAX_CONTENT)

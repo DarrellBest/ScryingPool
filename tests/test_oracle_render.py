@@ -568,6 +568,27 @@ def test_content_line_uses_plain_note_for_non_warning_narration():
     assert "note:" in line
 
 
+def test_content_line_names_an_ignored_set_level_constraint():
+    """Defect 3: a set-level constraint the router recognised but the pipeline
+    cannot enforce must show up as an honest `ignored:` line, not vanish."""
+    outcome = _outcome(plan={
+        "echo": 'filters: none · semantic: none',
+        "notes": [],
+        "ignored": ["no overlapping color identity"],
+        "scryfall_url": None,
+    })
+    line = oracle_render.oracle_content_line("q", outcome)
+    assert "ignored: no overlapping color identity" in line
+
+
+def test_content_line_has_no_ignored_line_when_nothing_was_dropped():
+    outcome = _outcome(plan={
+        "echo": 'filters: none · semantic: none', "notes": [], "scryfall_url": None,
+    })
+    line = oracle_render.oracle_content_line("q", outcome)
+    assert "ignored:" not in line
+
+
 # ------------------------------------------------------------------------- the message
 
 

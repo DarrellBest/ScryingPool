@@ -82,6 +82,71 @@ def test_types_is_union_within_the_field(conn):
     }
 
 
+def test_a_multiword_type_value_ands_its_own_tokens_instead_of_matching_zero(conn):
+    """Defect 1 (the reported bug): `card_types.value` stores single lowercase
+    tokens, one per row — verified live against data/oracle.db, where
+    value='legendary creature' has 0 rows even though value='legendary' has
+    4,470 and value='creature' has 18,651. A multi-word type filter must be
+    tokenised and ANDed against the per-token rows, or it silently matches
+    zero cards no matter how common the combination really is. Here "legendary
+    planeswalker" must match the one card carrying BOTH tokens, not zero."""
+    allowed = ofilters.compile_hard(conn, Filters(types=("legendary planeswalker",)), [])
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM cards WHERE oracle_id IN ({})".format(",".join("?" * len(allowed)) or "NULL"),
+        list(allowed),
+    )}
+    assert names == {"Nissa Placeholder"}
+
+
+def test_multiword_type_and_within_value_but_still_or_across_values(conn):
+    """The two levels of the algebra, exercised together: AND across the
+    tokens inside "legendary planeswalker", but still OR against the separate
+    "artifact" value — never confuse the two levels."""
+    allowed = ofilters.compile_hard(
+        conn, Filters(types=("legendary planeswalker", "artifact")), []
+    )
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM cards WHERE oracle_id IN ({})".format(",".join("?" * len(allowed))),
+        list(allowed),
+    )}
+    assert names == {"Nissa Placeholder", "Sol Talisman", "Sol Ring"}
+
+
+def test_an_unrecognised_type_token_is_dropped_and_noted_not_forced_to_zero(conn):
+    """A token that appears nowhere in card_types.value at all — a typo or a
+    router hallucination, not a real Magic word — must not silently produce
+    a valid-looking empty result. It is reported and dropped; since it is the
+    only value requested, the whole `types` field ends up unset (matches
+    everything) rather than an honest-looking zero."""
+    notes: list[str] = []
+    allowed = ofilters.compile_hard(conn, Filters(types=("hyperflux",)), notes)
+    assert allowed is None  # field treated as absent, not a forced empty set
+    assert notes and "hyperflux" in notes[0]
+    assert "not" in notes[0] or "no known" in notes[0].lower() or "does not match" in notes[0]
+
+
+def test_an_unrecognised_token_in_one_value_does_not_suppress_a_recognised_value(conn):
+    """types=("hyperflux", "artifact") must still return the artifacts —
+    dropping the bad value must not drop the whole field."""
+    notes: list[str] = []
+    allowed = ofilters.compile_hard(conn, Filters(types=("hyperflux", "artifact")), notes)
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM cards WHERE oracle_id IN ({})".format(",".join("?" * len(allowed)) or "NULL"),
+        list(allowed),
+    )}
+    assert names == {"Sol Talisman", "Sol Ring"}
+    assert notes and "hyperflux" in notes[0]
+
+
+def test_types_ids_direct_and_semantics_documented_in_the_module_docstring(conn):
+    """Same AND-within-a-value fact, asserted directly against `_types_ids`
+    rather than through `compile_hard`, so the unit under test is unambiguous."""
+    notes: list[str] = []
+    matched = ofilters._types_ids(conn, ("legendary planeswalker",), notes)
+    assert matched == {"o-planeswalker-g"}
+    assert notes == []
+
+
 def test_types_and_colors_and_across_fields(conn):
     notes: list[str] = []
     allowed = ofilters.compile_hard(conn, Filters(types=("enchantment",), colors="G"), notes)

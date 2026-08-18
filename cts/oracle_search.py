@@ -96,7 +96,10 @@ ROUTER_SYSTEM = (
     "search engine. A query usually has a structured half (card type, colour identity, "
     "mana value, format legality) and a mechanical half (what the card actually does). "
     "Your job is to pull out every structured constraint you can find and leave "
-    "everything else as a clean mechanical-intent phrase."
+    "everything else as a clean mechanical-intent phrase. Ground every structured field "
+    "in the real vocabulary given to you below — never in your own general knowledge of "
+    "Magic, which is exactly what causes a wrong guess like inferring a card TYPE from a "
+    "FORMAT name."
 )
 
 ROUTER_SCHEMA = {
@@ -111,6 +114,7 @@ ROUTER_SCHEMA = {
         "mv_hi": {"type": "number"},
         "semantic_intent": {"type": "string"},
         "vague_quantity_note": {"type": "string"},
+        "ignored_constraints": {"type": "array", "items": {"type": "string"}},
         "reasoning": {"type": "string"},
     },
     # mv_value/mv_lo/mv_hi are REQUIRED, not merely present in the schema:
@@ -127,17 +131,77 @@ ROUTER_SCHEMA = {
     # actual number (0 when genuinely unused, per the prompt's own
     # instruction), which is a value `_guard` can evaluate instead of a
     # missing key `_to_float` silently turns into None.
+    #
+    # ignored_constraints is REQUIRED for the same reason: an optional array
+    # field the model can simply omit is the same silent-omission shape —
+    # see the Defect 3 note on `ignored_constraints` in the prompt below.
     "required": ["types", "colors", "legal", "mv_op", "mv_value", "mv_lo", "mv_hi",
-                 "semantic_intent"],
+                 "semantic_intent", "ignored_constraints"],
 }
 
+
+def type_vocabulary(conn: sqlite3.Connection) -> str:
+    """The real, live supertypes and card types in `card_types` — queried
+    fresh from the corpus, not hand-maintained or guessed from the model's
+    own prior knowledge of Magic terminology.
+
+    Grounding the router in the actual vocabulary is the fix for a real,
+    observed failure: asked for "5 commanders that are planeswalkers", the
+    router (routing on its own general knowledge, not the corpus) mapped
+    "planeswalkers" to `type = legendary creature` — losing "planeswalker"
+    entirely and inventing a type combination the query never named, because
+    "a Commander needs a legendary creature" is a plausible-sounding but
+    wrong inference once "commander" is on the table. Showing the model the
+    real 36 supertype/type words (out of ~676 total; the ~640 subtypes are
+    summarised rather than enumerated — too many to usefully list, and rare
+    to be misread the way supertypes/types were here) removes the need to
+    guess at all.
+
+    Deliberately excludes subtypes (too many to enumerate — see above). Note
+    the supertype/type lists themselves are not hand-curated either: this
+    corpus is "every paper card" (silver-bordered and acorn included, per the
+    design doc), so a handful of joke/Un-set values (e.g. "eaturecray") show
+    up in the real `type` list too. They are shown as-is rather than filtered
+    out — the same "print what's actually there" discipline the ingest
+    checkpoints already use elsewhere in this repo, rather than a second,
+    hand-maintained list that can drift from the corpus.
+    """
+    supertypes = sorted(
+        r[0] for r in conn.execute("SELECT DISTINCT value FROM card_types WHERE kind = 'supertype'")
+    )
+    types = sorted(
+        r[0] for r in conn.execute("SELECT DISTINCT value FROM card_types WHERE kind = 'type'")
+    )
+    return (
+        "Real card supertypes in this corpus: " + ", ".join(supertypes) + ".\n"
+        "Real card types in this corpus: " + ", ".join(types) + ".\n"
+        "There are also several hundred creature/land/artifact/planeswalker SUBTYPES not "
+        "listed here (e.g. \"elf\", \"dragon\", \"equipment\", \"forest\", \"saga\") — if "
+        "the query names one, it still belongs in types, lowercase, as its own word, even "
+        "though it is not in the two lists above."
+    )
+
+
 ROUTER_PROMPT = """QUERY: "{query}"
+
+{vocab}
 
 Split the query into its structured half and its mechanical half.
 
 types — zero or more Magic card types/supertypes/subtypes the query explicitly
 names (e.g. "enchantment", "artifact", "creature", "planeswalker", "instant",
-"legendary"). Lowercase. Empty list if the query names none.
+"legendary"). Lowercase, singular ("planeswalkers" in the query -> "planeswalker"
+here). Only put a word here if it is a real type/supertype/subtype from the
+vocabulary above (or a subtype the vocabulary note says is not listed) — never a
+word that merely sounds Magic-flavored. Empty list if the query names none.
+
+FORMAT LEGALITY IS NEVER A TYPE. "Commander", "Modern", "Pauper", "Legacy",
+"Vintage", "Pioneer", "Standard" are DECK FORMATS, not card types — they always go
+in `legal`, never in `types`. Do not infer a card type from a format name: most
+Commander decks are led by a legendary creature, but that is a deckbuilding
+convention, not a rule this query is asking you to filter on — planeswalkers,
+too, can be commanders. Only put a type in `types` when the query itself names
+that type; never backfill one from what a format "usually" requires.
 
 colors — a string of letters from WUBRG if the query names a colour-identity
 constraint ("green" -> "G", "Selesnya" -> "GW"), else "". This is a SUBSET test:
@@ -165,10 +229,23 @@ mv_op to "" — do not guess a number — and put a short note about the word an
 what filter to use instead in vague_quantity_note.
 
 semantic_intent — the mechanical intent left over after removing the structured
-parts above, in a few plain words ("that let me draw", "that make tokens").
-Empty string "" if the query has NO mechanical intent at all — i.e. it is
-entirely structural ("green enchantments costing 5 or less" has no verb and
-gets "").
+parts above, in a few plain words ("that let me draw", "that make tokens"). This
+is ALWAYS a property of one card, judged on its own. Empty string "" if the
+query has NO mechanical intent at all — i.e. it is entirely structural ("green
+enchantments costing 5 or less" has no verb and gets "").
+
+ignored_constraints — zero or more short phrases for any part of the query that
+describes a RELATIONSHIP BETWEEN the cards in the result set, rather than a
+property of one card by itself. Examples: "no two cards share a color", "that
+don't overlap in color identity", "each one different from the others", "that
+combo with each other". This search engine judges every candidate card
+independently, with no visibility into the rest of the result set, so a
+constraint like this can never be enforced — not by a filter, not by the
+semantic search. Do NOT try to approximate it with a single-card substitute
+(e.g. do not turn "no overlapping color identity" into a `colors` filter on one
+card — that is a different question). Just name the clause here, in a few
+words, instead of silently dropping it. Empty list if every part of the query
+is a property of one card.
 
 reasoning — one short sentence naming where the query's meaning lives."""
 
@@ -180,14 +257,20 @@ def _to_float(value) -> float | None:
         return None
 
 
-def route(cfg: Config, query: str) -> dict:
-    """One judge_model call -> {filters, semantic_intent, notes}. Never raises."""
+def route(cfg: Config, conn: sqlite3.Connection, query: str) -> dict:
+    """One judge_model call -> {filters, semantic_intent, notes}. Never raises.
+
+    `conn` grounds the router in the real, live `card_types` vocabulary (see
+    `type_vocabulary`) rather than the model's own prior about Magic
+    terminology — the fix for Defect 2.
+    """
     notes: list[str] = []
+    vocab = type_vocabulary(conn)
     last_error = ""
     for attempt in (1, 2):
         try:
             raw = ollama.generate(
-                cfg, cfg.judge_model, ROUTER_PROMPT.format(query=query),
+                cfg, cfg.judge_model, ROUTER_PROMPT.format(query=query, vocab=vocab),
                 system=ROUTER_SYSTEM, format=ROUTER_SCHEMA,
                 options={"temperature": 0, "num_ctx": ROUTER_NUM_CTX},
             )
@@ -207,6 +290,11 @@ def route(cfg: Config, query: str) -> dict:
             if vague_note:
                 notes.append(vague_note)
             semantic_intent = " ".join(str(parsed.get("semantic_intent") or "").split())
+            ignored_constraints = [
+                " ".join(str(c).split())
+                for c in (parsed.get("ignored_constraints") or [])
+                if str(c).strip()
+            ]
             filters = Filters(
                 types=types, colors=colors, legal=legal, mv_op=mv_op,
                 mv_value=_to_float(parsed.get("mv_value")),
@@ -218,6 +306,7 @@ def route(cfg: Config, query: str) -> dict:
                 "reasoning": str(parsed.get("reasoning") or "").strip(),
                 "router_ok": True,
                 "notes": notes,
+                "ignored_constraints": ignored_constraints,
             }
         except (ValueError, RuntimeError, requests.RequestException) as exc:
             last_error = str(exc)
@@ -228,7 +317,7 @@ def route(cfg: Config, query: str) -> dict:
     notes.append(f"query routing failed ({last_error}); searched the whole corpus with no filters")
     return {
         "filters": Filters(), "semantic_intent": query, "reasoning": "",
-        "router_ok": False, "notes": notes,
+        "router_ok": False, "notes": notes, "ignored_constraints": [],
     }
 
 
@@ -587,10 +676,11 @@ def execute(
             }
 
         # ---------------------------------------------------------------------- route
-        routed = route(cfg, query)
+        routed = route(cfg, conn, query)
         notes.extend(routed["notes"])
         soft = routed["filters"]
         semantic_intent = routed["semantic_intent"]
+        ignored = routed.get("ignored_constraints") or []
 
         allowed = ofilters.compile_soft(conn, soft, notes, base=hard_ids)
         effective = _merge_for_echo(hard, soft)
@@ -601,6 +691,11 @@ def execute(
             "filters": {**hard.__dict__, **{k2: v for k2, v in soft.__dict__.items() if v}},
             "semantic_intent": semantic_intent,
             "notes": notes,
+            # A constraint the router recognised but this pipeline cannot
+            # enforce (a relationship between the results, not a property of
+            # one card — e.g. "no overlapping color identity") — see Defect 3.
+            # Named here rather than silently vanishing into "semantic: none".
+            "ignored": ignored,
             "echo": echo,
             "scryfall_url": scryfall_url,
             "router_ok": routed["router_ok"],
@@ -728,6 +823,9 @@ def run(
         print(outcome["message"])
     for note in plan.get("notes", []):
         print(f"note: {note}")
+    for clause in plan.get("ignored", []):
+        print(f"ignored: {clause} (this pipeline judges cards independently and cannot "
+              "enforce a constraint across the result set)")
     if plan.get("scryfall_url"):
         print(f"refine on Scryfall: {plan['scryfall_url']}")
 

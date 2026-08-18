@@ -71,16 +71,22 @@ def test_route_parses_a_well_formed_router_response(tmp_path, monkeypatch):
     payload = {
         "types": ["Enchantment"], "colors": "g", "legal": [],
         "mv_op": "<=", "mv_value": 5, "mv_lo": 0, "mv_hi": 0,
-        "semantic_intent": "let me draw", "vague_quantity_note": "", "reasoning": "x",
+        "semantic_intent": "let me draw", "vague_quantity_note": "",
+        "ignored_constraints": [], "reasoning": "x",
     }
     monkeypatch.setattr(oracle_search.ollama, "generate", lambda *a, **k: json.dumps(payload))
-    out = oracle_search.route(_cfg(tmp_path), "enchantments in green that draw, 5 or less")
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        out = oracle_search.route(_cfg(tmp_path), conn, "enchantments in green that draw, 5 or less")
+    finally:
+        conn.close()
     assert out["router_ok"] is True
     assert out["filters"].types == ("enchantment",)
     assert out["filters"].colors == "G"
     assert out["filters"].mv_op == "<="
     assert out["filters"].mv_value == 5
     assert out["semantic_intent"] == "let me draw"
+    assert out["ignored_constraints"] == []
 
 
 def test_route_carries_a_vague_quantity_note(tmp_path, monkeypatch):
@@ -88,12 +94,51 @@ def test_route_carries_a_vague_quantity_note(tmp_path, monkeypatch):
         "types": [], "colors": "", "legal": [], "mv_op": "", "mv_value": 0, "mv_lo": 0, "mv_hi": 0,
         "semantic_intent": "removal", "vague_quantity_note":
             '"cheap" has no defined mana value, so no cost filter was applied.',
+        "ignored_constraints": [], "reasoning": "x",
+    }
+    monkeypatch.setattr(oracle_search.ollama, "generate", lambda *a, **k: json.dumps(payload))
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        out = oracle_search.route(_cfg(tmp_path), conn, "cheap removal")
+    finally:
+        conn.close()
+    assert out["filters"].mv_op is None
+    assert any("cheap" in n for n in out["notes"])
+
+
+def test_route_reports_a_set_level_constraint_the_router_names(tmp_path, monkeypatch):
+    """Defect 3: a router that recognises a set-level clause ("no overlapping
+    color identity") it cannot express must surface it, not swallow it."""
+    payload = {
+        "types": ["planeswalker"], "colors": "", "legal": ["commander"],
+        "mv_op": "", "mv_value": 0, "mv_lo": 0, "mv_hi": 0,
+        "semantic_intent": "", "vague_quantity_note": "",
+        "ignored_constraints": ["no overlapping color identity across the 5 commanders"],
         "reasoning": "x",
     }
     monkeypatch.setattr(oracle_search.ollama, "generate", lambda *a, **k: json.dumps(payload))
-    out = oracle_search.route(_cfg(tmp_path), "cheap removal")
-    assert out["filters"].mv_op is None
-    assert any("cheap" in n for n in out["notes"])
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        out = oracle_search.route(
+            _cfg(tmp_path), conn,
+            "5 commanders that are planeswalkers that have no overlapping color identity",
+        )
+    finally:
+        conn.close()
+    assert out["ignored_constraints"] == ["no overlapping color identity across the 5 commanders"]
+
+
+def test_route_degrades_ignored_constraints_to_empty_on_router_failure(tmp_path, monkeypatch):
+    def explode(*a, **k):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(oracle_search.ollama, "generate", explode)
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        out = oracle_search.route(_cfg(tmp_path), conn, "green enchantments that draw")
+    finally:
+        conn.close()
+    assert out["ignored_constraints"] == []
 
 
 def test_router_schema_requires_the_numeric_fields_not_just_mv_op():
@@ -113,11 +158,36 @@ def test_route_degrades_to_no_filters_when_ollama_is_unreachable(tmp_path, monke
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(oracle_search.ollama, "generate", explode)
-    out = oracle_search.route(_cfg(tmp_path), "green enchantments that draw")
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        out = oracle_search.route(_cfg(tmp_path), conn, "green enchantments that draw")
+    finally:
+        conn.close()
     assert out["router_ok"] is False
     assert out["filters"] == Filters()
     assert out["semantic_intent"] == "green enchantments that draw"
     assert any("routing failed" in n for n in out["notes"])
+
+
+def test_type_vocabulary_is_grounded_in_the_real_card_types_table(tmp_path):
+    """Defect 2: the router prompt must be built from the corpus's actual
+    `card_types` rows, not a hardcoded or guessed list — this is what stops
+    "commanders" from being (mis)routed to `type = legendary creature`."""
+    conn = oracle_db.connect(_cfg(tmp_path))
+    try:
+        conn.executemany(
+            "INSERT INTO card_types(oracle_id, kind, value) VALUES (?, ?, ?)",
+            [("o1", "supertype", "legendary"), ("o1", "type", "planeswalker"),
+             ("o2", "type", "creature")],
+        )
+        conn.commit()
+        vocab = oracle_search.type_vocabulary(conn)
+    finally:
+        conn.close()
+    assert "legendary" in vocab
+    assert "planeswalker" in vocab
+    assert "creature" in vocab
+    assert "subtype" in vocab.lower()  # names that subtypes exist but aren't enumerated
 
 
 # -------------------------------------------------------------------------- expand
@@ -297,6 +367,33 @@ def test_structural_only_fast_path_when_the_router_finds_no_mechanical_intent(tm
     names = {r["name"] for r in out["results"]}
     assert names <= {"Verdant Genesis", "Green Scry Thing", "Green Loot Box"}
     assert all(r["fit"] is None for r in out["results"])
+
+
+def test_ignored_set_level_constraint_reaches_the_plan_honestly(tmp_path, conn, index, monkeypatch):
+    """Defect 3: "no overlapping color identity" is a relationship between the
+    RESULTS, not a property of one card — the pipeline judges cards
+    independently and deliberately does not implement set-level constraints.
+    It must say so (`plan["ignored"]`), not silently report `semantic: none`
+    as though the query had no unaddressed content at all."""
+    payload = {
+        "types": [], "colors": "G", "legal": [], "mv_op": "", "mv_value": 0, "mv_lo": 0, "mv_hi": 0,
+        "semantic_intent": "", "vague_quantity_note": "",
+        "ignored_constraints": ["no overlapping color identity"], "reasoning": "x",
+    }
+    monkeypatch.setattr(oracle_search.ollama, "generate", _stub_router(payload))
+    out = oracle_search.execute(_cfg(tmp_path), "green cards with no overlapping color identity",
+                                 conn=conn, index=index)
+    assert out["plan"]["ignored"] == ["no overlapping color identity"]
+
+
+def test_no_ignored_constraints_is_an_empty_list_not_a_missing_key(tmp_path, conn, index, monkeypatch):
+    payload = {
+        "types": [], "colors": "G", "legal": [], "mv_op": "", "mv_value": 0, "mv_lo": 0, "mv_hi": 0,
+        "semantic_intent": "", "vague_quantity_note": "", "ignored_constraints": [], "reasoning": "x",
+    }
+    monkeypatch.setattr(oracle_search.ollama, "generate", _stub_router(payload))
+    out = oracle_search.execute(_cfg(tmp_path), "green enchantments", conn=conn, index=index)
+    assert out["plan"]["ignored"] == []
 
 
 def test_the_full_semantic_pipeline_end_to_end(tmp_path, conn, index, monkeypatch):

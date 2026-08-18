@@ -11,6 +11,15 @@ The filter algebra
 means (enchantment OR artifact) AND green. There is no NOT, no nesting, no
 parentheses — see the design doc's *Not building*.
 
+One level down, inside a single `types` *value*, the rule flips: `value`
+column of `card_types` holds one lowercase token per row (verified against
+the real corpus — no row's `value` contains a space), so a multi-word type
+phrase like `"legendary creature"` is **AND across its own tokens** (a card
+must carry a `legendary` row AND a `creature` row), never a single-string
+lookup — see `_types_ids`'s docstring for the full story, including why the
+naive version of this returns a silent, landmine zero for every multi-word
+type filter.
+
 `colors` is the one field that is not UNION/AND at all: it is a single
 **subset** test, `color_identity ⊆ requested` — the Commander deck-legality
 rule. `cts/search.py::post_filter` already implements the identical test for
@@ -159,18 +168,70 @@ def _mv_predicate(f: Filters, notes: list[str]) -> tuple[str, list, str] | None:
 # ------------------------------------------------------------------- per-field sets
 
 
-def _types_ids(conn: sqlite3.Connection, types: tuple[str, ...]) -> set[str] | None:
-    """UNION within the field: matches supertype, type OR subtype."""
+def _types_ids(
+    conn: sqlite3.Connection, types: tuple[str, ...], notes: list[str]
+) -> set[str] | None:
+    """OR **across** values, AND **across the tokens inside one value**.
+
+    `card_types.value` stores single lowercase tokens, one per row — verified
+    live against `data/oracle.db`: `value='legendary'` -> 4,470 rows,
+    `value='creature'` -> 18,651, but `value='legendary creature'` -> **0**.
+    There is no row anywhere in the table whose value contains a space. So a
+    multi-word type phrase like "legendary creature" can never be tested with
+    a single `IN (...)` membership check — that always returns zero and
+    silently kills the entire query (Defect 1). It has to be tokenised and
+    every token ANDed: a card must carry a row for EACH token (legendary AND
+    creature), which is a `GROUP BY oracle_id HAVING COUNT(DISTINCT value) =
+    <token count>` over the token set.
+
+    This is a *different* level from the field-wide UNION-within-`types`
+    rule: `types=("planeswalker", "artifact")` is still planeswalker OR
+    artifact (each value contributes its own matched set, unioned below).
+    The AND is only ever across the tokens *inside one value* — "legendary
+    creature" means legendary AND creature, not "legendary" OR "creature".
+
+    A token that never appears anywhere in `card_types.value` (a typo, or a
+    router hallucination — not a real Magic word) must not silently produce
+    a valid-looking zero either. It is reported in `notes` and that one
+    value is dropped from the match entirely, rather than ANDed in and
+    forced to zero. If every value in `types` turns out unrecognised, the
+    whole field is treated as unset (returns None) rather than an
+    honest-looking-but-meaningless empty set — the notes already say why.
+    """
     if not types:
         return None
     values = [t.strip().lower() for t in types if t.strip()]
     if not values:
         return None
-    marks = ",".join("?" * len(values))
-    rows = conn.execute(
-        f"SELECT DISTINCT oracle_id FROM card_types WHERE value IN ({marks})", values
-    )
-    return {r[0] for r in rows}
+
+    known = {r[0] for r in conn.execute("SELECT DISTINCT value FROM card_types")}
+    matched: set[str] = set()
+    any_recognized = False
+    for value in values:
+        tokens = sorted(set(value.split()))
+        if not tokens:
+            continue
+        unknown = [t for t in tokens if t not in known]
+        if unknown:
+            word = "token" if len(unknown) == 1 else "tokens"
+            notes.append(
+                f'type "{value}" was dropped: {word} {", ".join(unknown)} do not match '
+                "any known card type, supertype, or subtype (so it was not applied, "
+                "rather than silently matching zero cards)"
+            )
+            continue
+        any_recognized = True
+        marks = ",".join("?" * len(tokens))
+        rows = conn.execute(
+            f"SELECT oracle_id FROM card_types WHERE value IN ({marks}) "
+            "GROUP BY oracle_id HAVING COUNT(DISTINCT value) = ?",
+            [*tokens, len(tokens)],
+        )
+        matched |= {r[0] for r in rows}
+
+    if not any_recognized:
+        return None
+    return matched
 
 
 def _legal_ids(conn: sqlite3.Connection, legal: tuple[str, ...]) -> set[str] | None:
@@ -213,7 +274,7 @@ def field_sets(
 ) -> dict[str, set[str]]:
     """Every non-empty field's own matching set, computed independently."""
     sets: dict[str, set[str]] = {}
-    types = _types_ids(conn, f.types)
+    types = _types_ids(conn, f.types, notes)
     if types is not None:
         sets[f"type = {', '.join(sorted(t.strip().lower() for t in f.types if t.strip()))}"] = types
     legal = _legal_ids(conn, f.legal)
