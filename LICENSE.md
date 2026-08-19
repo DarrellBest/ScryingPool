@@ -4,8 +4,8 @@ Required Notice: Copyright Darrell Best (https://github.com/DarrellBest/ScryingP
 
 Scrying Pool is free to use, modify and share for personal use and any other noncommercial
 purpose, under the terms of the PolyForm Noncommercial License 1.0.0 reproduced in full below.
-Any commercial use requires a separate paid licence from the copyright holder — open a GitHub
-issue on this repository to arrange one.
+Any commercial use requires a separate paid licence from the copyright holder — see the
+Additional Terms after the license text.
 
 ---
 
@@ -82,3 +82,33 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 **Your licenses** are all the licenses granted to you for the software under these terms.
 
 **Use** means anything you do with the software requiring one of your licenses.
+
+---
+
+==============================================================================
+ADDITIONAL TERMS (RIDER)
+
+The following terms are supplemental terms offered by the licensor, Darrell
+Best. They are NOT part of the PolyForm Noncommercial License 1.0.0 text
+reproduced above and they do not modify, reinterpret, or form part of that
+text. They apply in addition to it, as conditions of the licenses granted.
+
+1. Attribution.
+
+   Any distribution of the software, any derivative work or new work based on
+   the software, and any product or service built on or incorporating the
+   software must give visible credit to Darrell Best and must link to
+   the project's repository at https://github.com/DarrellBest/ScryingPool.
+
+   That credit must appear in a user-facing location -- for example, project
+   documentation, a README, an "About" or "Credits" screen, a startup banner,
+   or an equivalent place a user or reader will actually see. Preserving
+   copyright headers inside source files alone does NOT satisfy this
+   requirement.
+
+2. Commercial licensing.
+
+   Commercial use is not granted by this license. Commercial licenses are
+   available. To request one, email scryingpool@darrellbest.com with the
+   subject line "commercial licensing".
+==============================================================================

@@ -819,8 +819,12 @@ approved or endorsed by Wizards. Portions of the materials used are property of 
 © Wizards of the Coast LLC.
 
 **Licence** — the code is licensed under [PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal use and
-any other noncommercial purpose. Commercial use requires a separate paid licence, so open an issue to arrange
-one. Every copy must carry the copyright notice at the top of `LICENSE.md`.
+any other noncommercial purpose. Commercial use is not granted by that licence; commercial licences are
+available, so email `scryingpool@darrellbest.com` with the subject line "commercial licensing" to arrange one.
+Attribution is required: anything distributed, derived from, or built on this project must give visible credit
+to Darrell Best and link this repository somewhere a user or reader will actually see it (documentation, an
+about/credits screen, or equivalent). Every copy must also carry the copyright notice at the top of
+`LICENSE.md`. See the Additional Terms at the end of `LICENSE.md` for the full wording.
 
 <div align="center">
 <br>
