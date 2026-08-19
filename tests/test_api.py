@@ -325,6 +325,41 @@ def test_health_counts_completed_searches(client):
     assert health["search"]["last_search_seconds"] is not None
 
 
+def test_health_reports_an_empty_scry_window_before_any_search(client):
+    """Fresh install / empty `search_timings`: the fallback case render.py's
+    `median_seconds_for` reacts to."""
+    body = client.get("/health").json()
+    assert body["timings"]["scry"] == {"median_seconds": None, "samples": 0}
+
+
+def test_health_has_no_oracle_timings_when_this_process_has_no_oracle_corpus(client):
+    assert "oracle" not in client.get("/health").json()["timings"]
+
+
+def test_health_reports_the_scry_median_after_a_search(client):
+    client.post("/search", json={"theme": "lonely"})
+    timings = client.get("/health").json()["timings"]["scry"]
+    assert timings["samples"] == 1
+    assert timings["median_seconds"] is not None
+    assert timings["median_seconds"] >= 0.0
+
+
+def test_health_scry_median_reflects_several_completed_searches(client):
+    for _ in range(3):
+        client.post("/search", json={"theme": "lonely"})
+    timings = client.get("/health").json()["timings"]["scry"]
+    assert timings["samples"] == 3
+
+
+def test_health_oracle_median_is_tracked_separately_from_scry(oracle_client):
+    """/scry and /oracle write to different databases, so a search on one
+    must never move the other's median."""
+    oracle_client.post("/oracle/search", json={"query": "cards that draw"})
+    body = oracle_client.get("/health").json()
+    assert body["timings"]["oracle"]["samples"] == 1
+    assert body["timings"]["scry"]["samples"] == 0
+
+
 def test_health_is_degraded_when_ollama_is_unreachable(conn):
     with TestClient(create_app(make_engine(conn, ollama=support.ollama_down))) as client:
         body = client.get("/health").json()

@@ -120,6 +120,15 @@ CREATE TABLE IF NOT EXISTS judgments  (query_id INTEGER, oracle_id TEXT, fit REA
                                        rationale TEXT, chunk_ids TEXT, model TEXT,
                                        source TEXT);
 CREATE TABLE IF NOT EXISTS meta       (key TEXT PRIMARY KEY, value TEXT);
+-- The /oracle analogue of the same table in cts/db.py's schema; see
+-- cts/timings.py for why this lives in both databases identically rather
+-- than being imported across the deliberate art/oracle split.
+CREATE TABLE IF NOT EXISTS search_timings (
+  id              INTEGER PRIMARY KEY,
+  query_id        INTEGER,
+  elapsed_seconds REAL,
+  created_at      TEXT
+);
 
 CREATE INDEX IF NOT EXISTS idx_chunks_oracle_id   ON chunks(oracle_id);
 CREATE INDEX IF NOT EXISTS idx_cards_name_norm    ON cards(name_norm);

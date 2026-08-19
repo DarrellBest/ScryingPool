@@ -210,11 +210,49 @@ def test_json_or_none_rejects_a_non_dict_body():
 
 
 def test_the_refresh_timeout_fits_inside_discords_deferred_token():
-    """15 minutes is the hard bound; 780s leaves two minutes to render and edit."""
-    assert bot.SEARCH_TIMEOUT_REFRESHING < 15 * 60
-    assert bot.SEARCH_TIMEOUT_REFRESHING > bot.SEARCH_TIMEOUT
-    # Worst-case search is 106.7s; the normal timeout must clear it with room.
-    assert bot.SEARCH_TIMEOUT > 107 * 2
+    """15 minutes is the hard bound; both ceilings must clear it with margin,
+    and the refreshing ceiling must stay above the normal one."""
+    assert bot.REFRESHING_TIMEOUT_CEILING < 15 * 60
+    assert bot.REFRESHING_TIMEOUT_CEILING > bot.NORMAL_TIMEOUT_CEILING
+
+
+def test_compute_search_timeout_scales_with_the_median():
+    """A model swap that changes the median changes the timeout with it."""
+    fast = bot.compute_search_timeout(50.0, refreshing=False)
+    slow = bot.compute_search_timeout(150.0, refreshing=False)
+    assert slow > fast
+
+
+def test_compute_search_timeout_covers_todays_measured_scry_figures():
+    """155s warm and 217s cold /scry, plus >300s of contention seen the same
+    day, must all comfortably clear the normal (non-refreshing) timeout."""
+    timeout = bot.compute_search_timeout(155.0, refreshing=False)
+    assert timeout > 217.0
+    assert timeout > 300.0
+
+
+def test_compute_search_timeout_has_a_floor():
+    """A very fast median must not collapse the timeout to nothing — some
+    slack is always warranted for a single HTTP round trip."""
+    timeout = bot.compute_search_timeout(1.0, refreshing=False)
+    assert timeout == bot.NORMAL_TIMEOUT_FLOOR
+
+
+def test_compute_search_timeout_has_a_ceiling():
+    timeout = bot.compute_search_timeout(10_000.0, refreshing=False)
+    assert timeout == bot.NORMAL_TIMEOUT_CEILING
+
+
+def test_compute_search_timeout_refreshing_is_more_generous():
+    normal = bot.compute_search_timeout(85.0, refreshing=False)
+    refreshing = bot.compute_search_timeout(85.0, refreshing=True)
+    assert refreshing > normal
+    assert refreshing == bot.REFRESHING_TIMEOUT_FLOOR
+
+
+def test_compute_search_timeout_refreshing_respects_its_own_ceiling():
+    timeout = bot.compute_search_timeout(1_000.0, refreshing=True)
+    assert timeout == bot.REFRESHING_TIMEOUT_CEILING
 
 
 # ----------------------------------------------------------------------- health probing

@@ -8,9 +8,11 @@ layer is two processes instead of one.
 Three things shape every line in here:
 
 1. **Defer first, before anything else.** Discord kills an interaction that is
-   not acknowledged within 3 seconds. The search takes 76.8s on average and
-   106.7s at worst, and `/health` runs before it. So the very first await in the
-   command is `defer(thinking=True)`, which buys a 15-minute token.
+   not acknowledged within 3 seconds. A search takes on the order of a minute
+   or two — the exact figure is model-dependent and now tracked as a measured
+   median rather than hardcoded, see `render.median_seconds_for` — and
+   `/health` runs before it. So the very first await in the command is
+   `defer(thinking=True)`, which buys a 15-minute token.
 2. **The buttons must outlive the process.** They are `DynamicItem`s whose whole
    identity is encoded in `custom_id`, not a `View` held in memory. A restart
    with an ordinary View leaves every 👍 in the channel silently dead, and this
@@ -70,11 +72,51 @@ DEFAULT_API_URL = "http://127.0.0.1:8077"
 HEALTH_TIMEOUT = 10.0       # cheap and cached server-side; never worth waiting on
 FEEDBACK_TIMEOUT = 30.0     # its own short-lived connection, never behind the search lock
 
-# 300s normally; 780s when /health said a refresh is running. 13 minutes sits
-# inside the 15-minute deferred token with margin, and it is the real bound on how
-# long a thrashing search is waited on.
-SEARCH_TIMEOUT = 300.0
-SEARCH_TIMEOUT_REFRESHING = 780.0
+# The client-side HTTP timeout is derived from each command's own measured
+# median (render.median_seconds_for) via `compute_search_timeout()` below,
+# rather than a flat constant — a flat 300s is exactly what went stale and
+# marginal the moment the model swap pushed /scry to ~155s warm / ~217s cold,
+# and a future model swap would silently do it again.
+#
+# NORMAL_TIMEOUT_MULTIPLIER covers both known sources of variance around the
+# median in one factor rather than tracking them separately: cold vs warm
+# (217s cold vs 155s warm measured for /scry, ~1.4x) AND GPU contention from a
+# concurrent search (>300s seen the same day, ~2x warm). 3x comfortably clears
+# both at once.
+NORMAL_TIMEOUT_MULTIPLIER = 3.0
+NORMAL_TIMEOUT_FLOOR = 120.0        # even a fast median deserves some slack
+NORMAL_TIMEOUT_CEILING = 600.0      # 10 min: real margin under the 15-min deferred token
+
+# A weekly corpus refresh is a KNOWN, not a rare, source of multi-times
+# slowdown — it fights the search for the same GPU — so it gets a larger
+# multiplier and a much higher floor, still capped short of Discord's
+# 15-minute deferred-token bound with margin to render and edit the reply.
+# The ceiling matches the old fixed 780s's own reasoning: 13 minutes sits
+# inside the 15-minute token with margin, and is the real bound on how long a
+# thrashing search is waited on.
+REFRESHING_TIMEOUT_MULTIPLIER = 5.0
+REFRESHING_TIMEOUT_FLOOR = 600.0
+REFRESHING_TIMEOUT_CEILING = 780.0
+
+
+def compute_search_timeout(median_seconds: float, *, refreshing: bool) -> float:
+    """`median_seconds * multiplier`, clamped to `[floor, ceiling]`.
+
+    Scales automatically with whatever `/health` currently reports as the
+    measured median for the command being run, so a model swap that changes
+    latency (like the one that made this dynamic in the first place) updates
+    this timeout without a code change. See the constants above for why the
+    multiplier/floor/ceiling triples are what they are.
+    """
+    if refreshing:
+        multiplier, floor, ceiling = (
+            REFRESHING_TIMEOUT_MULTIPLIER, REFRESHING_TIMEOUT_FLOOR, REFRESHING_TIMEOUT_CEILING,
+        )
+    else:
+        multiplier, floor, ceiling = (
+            NORMAL_TIMEOUT_MULTIPLIER, NORMAL_TIMEOUT_FLOOR, NORMAL_TIMEOUT_CEILING,
+        )
+    return min(ceiling, max(floor, median_seconds * multiplier))
 
 # `/search` does not defer, so the ENTIRE round trip has to fit inside Discord's
 # 3-second acknowledgement window. The server side is ~20ms of dict lookups over
@@ -429,12 +471,13 @@ async def run_scry(
             await _edit(interaction, content=render.api_down_message())
             return
 
-        await _edit(interaction, content=render.placeholder(health))
+        await _edit(interaction, content=render.placeholder(health, "scry"))
 
         # `refresh` may be present-but-null when systemctl could not answer, so this
         # cannot be a two-step .get() with a {} default.
         refreshing = ((health or {}).get("refresh") or {}).get("running") is True
-        timeout = SEARCH_TIMEOUT_REFRESHING if refreshing else SEARCH_TIMEOUT
+        median_seconds, _ = render.median_seconds_for(health, "scry")
+        timeout = compute_search_timeout(median_seconds, refreshing=refreshing)
 
         payload: dict[str, Any] = {"theme": theme, "k": k}
         if band is not None:
@@ -512,9 +555,10 @@ async def run_oracle(
     """Defer, placeholder, POST /oracle/search, edit in place — the same
     shape `run_scry` uses, over a different endpoint. `/oracle` shares
     `/scry`'s queue and lock server-side (see `Engine.oracle_search`), so the
-    same placeholder-from-/health and the same generous timeout apply: a
-    search queued behind an 80-second `/scry` is a real, expected wait, not a
-    failure to explain differently.
+    same placeholder-from-/health and the same generous, median-derived
+    timeout apply: a search queued behind a `/scry` that takes on the order of
+    a minute or two is a real, expected wait, not a failure to explain
+    differently.
     """
     async with httpx.AsyncClient() as client:
         health, api_down = await fetch_health(client)
@@ -522,10 +566,11 @@ async def run_oracle(
             await _edit(interaction, content=render.api_down_message())
             return
 
-        await _edit(interaction, content=render.placeholder(health))
+        await _edit(interaction, content=render.placeholder(health, "oracle"))
 
         refreshing = ((health or {}).get("refresh") or {}).get("running") is True
-        timeout = SEARCH_TIMEOUT_REFRESHING if refreshing else SEARCH_TIMEOUT
+        median_seconds, _ = render.median_seconds_for(health, "oracle")
+        timeout = compute_search_timeout(median_seconds, refreshing=refreshing)
 
         payload: dict[str, Any] = {"query": query, "k": k}
         if types:
@@ -648,9 +693,9 @@ async def run_search(interaction: discord.Interaction, name: str) -> None:
 
     `/search` makes zero LLM calls — no router, no expansion, no embedding, no
     judge — so it touches neither Ollama nor the GPU, takes no search lock and is
-    not counted against the queue cap. A name lookup queued behind an 80-second
-    `/scry` would be absurd; the lock exists solely to serialise contention for
-    one Ollama instance that this command never uses.
+    not counted against the queue cap. A name lookup queued behind a
+    minute-plus `/scry` would be absurd; the lock exists solely to serialise
+    contention for one Ollama instance that this command never uses.
 
     The work is ~20ms, so the reply goes out with `response.send_message` and
     there is no "thinking…" state at all. That visible difference is itself

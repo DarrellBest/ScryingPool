@@ -58,6 +58,19 @@ LINK_LABELS = (
 # label beats a refusal, so it is rendered as a warning over real results.
 DEGRADED_PREFIX = "⚠️"
 
+# Fallback estimates for `placeholder()`, used ONLY when `/health` has no
+# persisted median yet (a fresh install, or a `search_timings` window that is
+# still empty). They are deliberately not kept in sync with reality after
+# that — real medians take over the instant the first search completes — so
+# the rendered text always says "(estimate, no data yet)" alongside them
+# rather than implying a precision nobody measured. Set from the numbers
+# measured right after the scryingpool-qwen3.8 model swap: ~155s warm for
+# /scry, ~84.5s for /oracle.
+SCRY_FALLBACK_SECONDS = 155.0
+ORACLE_FALLBACK_SECONDS = 85.0
+
+_FALLBACK_SECONDS = {"scry": SCRY_FALLBACK_SECONDS, "oracle": ORACLE_FALLBACK_SECONDS}
+
 
 def _truncate(text: str, limit: int) -> str:
     """Cut to `limit` characters, ellipsis included in the budget."""
@@ -114,15 +127,55 @@ def decode_custom_id(custom_id: str) -> tuple[int, str, bool] | None:
 # ------------------------------------------------------------------------ placeholders
 
 
-def placeholder(health: dict | None) -> str:
+def format_duration(seconds: float) -> str:
+    """Humane duration: `"45s"` under a minute, `"2m30s"` at and above it.
+
+    Deliberately not zero-padded (`"2m30s"`, not `"2m03s"`) — this is a rough
+    "about how long" figure, not a stopwatch reading.
+    """
+    total = max(0, round(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m{secs}s"
+
+
+def median_seconds_for(health: dict | None, command: str) -> tuple[float, bool]:
+    """`(seconds, is_estimate)` for `command` (`"scry"` or `"oracle"`).
+
+    Reads `health["timings"][command]["median_seconds"]` — the server's own
+    rolling window over the last ~20 completed searches for that command (see
+    `cts.timings`). Falls back to a constant, flagged `is_estimate=True`,
+    whenever `/health` could not be fetched at all, or the window has no
+    samples yet: never invents precision the server itself does not have.
+    """
+    if isinstance(health, dict):
+        block = (health.get("timings") or {}).get(command) or {}
+        seconds = block.get("median_seconds")
+        samples = block.get("samples") or 0
+        if isinstance(seconds, (int, float)) and seconds > 0 and samples > 0:
+            return float(seconds), False
+    return _FALLBACK_SECONDS.get(command, SCRY_FALLBACK_SECONDS), True
+
+
+def placeholder(health: dict | None, command: str = "scry") -> str:
     """The line posted into the deferred response before the search starts.
 
     Built from `/health` so that a four-minute search at 03:20 on a Sunday is
     explained rather than mysterious. Information, not enforcement — a refresh
     makes searches slow, and this design refuses to invent an outage out of that.
+
+    `command` picks which of `/scry`'s or `/oracle`'s own measured median to
+    quote — they run genuinely different work (155s vs 84.5s at last
+    measurement) and reporting one number for both would just be wrong for
+    whichever command it wasn't measured on.
     """
+    seconds, estimated = median_seconds_for(health, command)
+    duration = format_duration(seconds)
+    estimate_note = " (estimate, no data yet)" if estimated else ""
+
     if not isinstance(health, dict):
-        return "🔮 scrying… ~80s"
+        return f"🔮 scrying… ~{duration}{estimate_note}"
 
     search = health.get("search") or {}
     queued = search.get("queued") or 0
@@ -131,18 +184,20 @@ def placeholder(health: dict | None) -> str:
 
     line = "🔮 scrying… "
     if ahead > 0:
-        # ~107s worst case each; round to whole minutes because the estimate does
-        # not deserve more precision than that.
-        minutes = max(1, round((ahead + 1) * 90 / 60))
+        # Per-item cost is this command's own median (or fallback) — the best
+        # available estimate without knowing the /scry-vs-/oracle mix of
+        # whatever is actually queued ahead. Rounded to whole minutes because
+        # the estimate does not deserve more precision than that.
+        minutes = max(1, round((ahead + 1) * seconds / 60))
         plural = "search" if ahead == 1 else "searches"
         line += f"queued behind {ahead} {plural}, ~{minutes} min"
     else:
-        line += "~80s"
+        line += f"~{duration}{estimate_note}"
 
     if (health.get("refresh") or {}).get("running") is True:
         line += (
             "\n⚠️ the weekly corpus refresh is running, so this will be slow — "
-            "several minutes rather than ~80s."
+            f"several minutes rather than ~{duration}."
         )
     elif (health.get("ollama") or {}).get("reachable") is False:
         line += (

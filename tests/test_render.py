@@ -372,51 +372,146 @@ def test_button_specs_are_empty_for_an_empty_result_set():
     assert render.button_specs(_outcome(results=[])) == []
 
 
+# --------------------------------------------------------------------- format_duration
+
+
+def test_format_duration_under_a_minute():
+    assert render.format_duration(45) == "45s"
+    assert render.format_duration(0) == "0s"
+
+
+def test_format_duration_at_and_above_a_minute():
+    assert render.format_duration(150) == "2m30s"
+    assert render.format_duration(60) == "1m0s"
+
+
+def test_format_duration_rounds_rather_than_truncates():
+    # 59.6 rounds to 60, which is a whole minute, not "60s".
+    assert render.format_duration(59.6) == "1m0s"
+
+
+def test_format_duration_never_goes_negative():
+    assert render.format_duration(-5) == "0s"
+
+
+# ------------------------------------------------------------------- median_seconds_for
+
+
+def test_median_seconds_for_reads_the_measured_value():
+    health = {"timings": {"scry": {"median_seconds": 155.2, "samples": 20}}}
+    seconds, estimated = render.median_seconds_for(health, "scry")
+    assert seconds == 155.2
+    assert estimated is False
+
+
+def test_median_seconds_for_falls_back_when_samples_are_zero():
+    health = {"timings": {"scry": {"median_seconds": None, "samples": 0}}}
+    seconds, estimated = render.median_seconds_for(health, "scry")
+    assert seconds == render.SCRY_FALLBACK_SECONDS
+    assert estimated is True
+
+
+def test_median_seconds_for_falls_back_when_health_is_missing():
+    seconds, estimated = render.median_seconds_for(None, "scry")
+    assert seconds == render.SCRY_FALLBACK_SECONDS
+    assert estimated is True
+
+
+def test_median_seconds_for_falls_back_when_the_timings_key_is_absent():
+    """An older API build, or one that hasn't been restarted yet post-upgrade."""
+    health = {"search": {"queued": 0, "in_flight": 0}}
+    seconds, estimated = render.median_seconds_for(health, "oracle")
+    assert seconds == render.ORACLE_FALLBACK_SECONDS
+    assert estimated is True
+
+
+def test_median_seconds_for_is_per_command():
+    health = {
+        "timings": {
+            "scry": {"median_seconds": 155.0, "samples": 20},
+            "oracle": {"median_seconds": 84.5, "samples": 12},
+        }
+    }
+    assert render.median_seconds_for(health, "scry")[0] == 155.0
+    assert render.median_seconds_for(health, "oracle")[0] == 84.5
+
+
 # ---------------------------------------------------------------------- the placeholder
 
 
+def _health(command="scry", median=155.0, samples=20, overrides=None):
+    body = {
+        "search": {"queued": 0, "in_flight": 0},
+        "refresh": {"running": False},
+        "timings": {command: {"median_seconds": median, "samples": samples}},
+    }
+    body.update(overrides or {})
+    return body
+
+
 def test_placeholder_normal():
-    health = {"search": {"queued": 0, "in_flight": 0}, "refresh": {"running": False}}
-    assert render.placeholder(health) == "🔮 scrying… ~80s"
+    health = _health("scry", median=150.0)
+    assert render.placeholder(health, "scry") == "🔮 scrying… ~2m30s"
+
+
+def test_placeholder_defaults_to_scry_when_no_command_given():
+    health = _health("scry", median=150.0)
+    assert render.placeholder(health) == "🔮 scrying… ~2m30s"
+
+
+def test_placeholder_uses_the_oracle_median_for_oracle():
+    health = _health("oracle", median=84.5)
+    assert render.placeholder(health, "oracle") == "🔮 scrying… ~1m24s"
 
 
 def test_placeholder_when_queued_behind_someone():
-    health = {"search": {"queued": 0, "in_flight": 1}, "refresh": {"running": False}}
-    line = render.placeholder(health)
+    health = _health("scry", overrides={"search": {"queued": 0, "in_flight": 1}})
+    line = render.placeholder(health, "scry")
     assert "queued behind 1 search," in line
     assert "min" in line
 
 
 def test_placeholder_pluralises_the_queue():
-    health = {"search": {"queued": 2, "in_flight": 1}, "refresh": {"running": False}}
-    assert "queued behind 3 searches," in render.placeholder(health)
+    health = _health("scry", overrides={"search": {"queued": 2, "in_flight": 1}})
+    assert "queued behind 3 searches," in render.placeholder(health, "scry")
 
 
 def test_placeholder_explains_a_running_refresh():
     """The entire user-facing consequence of GPU contention. Information, not a refusal."""
-    health = {"search": {"queued": 0, "in_flight": 0}, "refresh": {"running": True}}
-    line = render.placeholder(health)
+    health = _health("scry", median=150.0, overrides={"refresh": {"running": True}})
+    line = render.placeholder(health, "scry")
     assert "weekly corpus refresh is running" in line
-    assert "several minutes rather than ~80s" in line
+    assert "several minutes rather than ~2m30s" in line
 
 
 def test_placeholder_warns_when_ollama_is_unreachable():
-    health = {
-        "search": {"queued": 0, "in_flight": 0},
-        "refresh": {"running": False},
-        "ollama": {"reachable": False},
-    }
-    assert "Ollama is unreachable" in render.placeholder(health)
+    health = _health("scry", overrides={"ollama": {"reachable": False}})
+    assert "Ollama is unreachable" in render.placeholder(health, "scry")
 
 
 def test_placeholder_without_health_still_says_something():
-    assert render.placeholder(None) == "🔮 scrying… ~80s"
+    line = render.placeholder(None, "scry")
+    assert line.startswith("🔮 scrying… ~")
+    assert "(estimate, no data yet)" in line
+
+
+def test_placeholder_falls_back_when_the_window_is_still_empty():
+    """A fresh install: /health exists but no search has completed yet."""
+    health = _health("scry", median=None, samples=0)
+    line = render.placeholder(health, "scry")
+    assert "(estimate, no data yet)" in line
+    assert render.format_duration(render.SCRY_FALLBACK_SECONDS) in line
+
+
+def test_placeholder_with_real_data_has_no_estimate_caveat():
+    health = _health("scry", median=150.0, samples=20)
+    assert "estimate" not in render.placeholder(health, "scry")
 
 
 def test_placeholder_treats_unknown_refresh_state_as_not_running():
     """`None` is 'systemctl could not answer', which is not 'a refresh is running'."""
-    health = {"search": {"queued": 0, "in_flight": 0}, "refresh": {"running": None}}
-    assert "refresh is running" not in render.placeholder(health)
+    health = _health("scry", overrides={"refresh": {"running": None}})
+    assert "refresh is running" not in render.placeholder(health, "scry")
 
 
 # ---------------------------------------------------------------------------- error prose

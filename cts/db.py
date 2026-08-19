@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS queries (
   created_at TEXT
 );
 
+-- one row per completed search, read back as a rolling-window MEDIAN by
+-- serve.api (see cts/timings.py) to drive the bot's "~2m30s" estimate.
+-- Never pruned; the window is enforced by the read query's LIMIT, not by
+-- deleting history, same as queries/retrievals/judgments below.
+CREATE TABLE IF NOT EXISTS search_timings (
+  id              INTEGER PRIMARY KEY,
+  query_id        INTEGER,
+  elapsed_seconds REAL,
+  created_at      TEXT
+);
+
 CREATE TABLE IF NOT EXISTS retrievals (
   query_id        INTEGER,
   illustration_id TEXT,

@@ -16,8 +16,10 @@ the four things worth knowing before reading the code are:
    work regardless, so a second concurrent search would only make both slower.
    The lock is also what makes a `check_same_thread=False` connection safe.
 4. **The search runs on a worker thread.** `execute` is blocking synchronous
-   code that takes ~80s; on the event loop it would make `/health` unanswerable
-   for the whole of it, which is the one moment anyone actually wants `/health`.
+   code that takes on the order of a minute or more (the actual figure is
+   model-dependent and tracked as a measured median — see `cts/timings.py`);
+   on the event loop it would make `/health` unanswerable for the whole of
+   it, which is the one moment anyone actually wants `/health`.
 
 Run it with `python -m serve.api`.
 """
@@ -43,6 +45,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cts import db, ollama as ollama_mod, oracle_db, oracle_names, search as search_mod
+from cts import timings as timing_mod
 from cts import oracle_index as oracle_index_mod, oracle_search as oracle_search_mod
 from cts.config import Config, load_config
 from cts.index import SearchIndex, load_index
@@ -815,7 +818,7 @@ class Engine:
                     self.last_oracle_poll_rebuild = time.monotonic()
 
         if self.lock.locked():
-            # A search holds it. Do not queue behind ~80s of GPU work; try again
+            # A search holds it. Do not queue behind a minute-plus of GPU work; try again
             # in a minute.
             return "skipped"
         if await self.refresh.get() is True:
@@ -892,6 +895,9 @@ class Engine:
         self.searches_since_start += 1
         self.last_search_seconds = round(elapsed, 3)
 
+        if isinstance(outcome, dict) and outcome.get("query_id") is not None:
+            self._record_timing(self.conn, outcome["query_id"], elapsed)
+
         if isinstance(outcome, dict):
             outcome = dict(outcome)
             # Before _degraded(), which reads plan.notes: an index that is
@@ -906,6 +912,18 @@ class Engine:
                 "degraded": _degraded(outcome),
             }
         return outcome
+
+    def _record_timing(self, conn: sqlite3.Connection, query_id: int, elapsed: float) -> None:
+        """Persist one completed search's duration for the median `/health`
+        reports and the bot renders. Best-effort and deliberately swallows its
+        own failures: by this point the user's actual result is already
+        computed (and, for /scry, already logged to `queries`), so a timing
+        write going wrong must never turn a delivered answer into an error.
+        """
+        try:
+            timing_mod.record(conn, query_id, elapsed)
+        except Exception:                              # noqa: BLE001 - see docstring
+            traceback.print_exc()
 
     def _note_missing_embeddings(self, outcome: dict) -> None:
         """Say so when the embed stage is running behind the vision stage."""
@@ -964,6 +982,12 @@ class Engine:
 
         self.searches_since_start += 1
         self.last_search_seconds = round(elapsed, 3)
+
+        if isinstance(outcome, dict) and outcome.get("query_id") is not None:
+            # self.oracle_conn, not self.conn: /oracle's queries table (and now
+            # its search_timings) lives in the separate oracle database, so
+            # /scry and /oracle medians never mix.
+            self._record_timing(self.oracle_conn, outcome["query_id"], elapsed)
 
         if isinstance(outcome, dict):
             outcome = dict(outcome)
@@ -1029,6 +1053,27 @@ class Engine:
 
         now = _utcnow()
         oracle_block = self._oracle_health(now)
+
+        # Per-command rolling-window medians (cts/timings.py) — what the bot's
+        # placeholder renders instead of a hardcoded "~80s". /scry and /oracle
+        # write to different databases, so this reads self.conn for one and
+        # self.oracle_conn for the other rather than one shared query. "scry"
+        # is always reported; "oracle" only when this process has an oracle
+        # corpus at all, mirroring `oracle_block` just above.
+        scry_median, scry_samples = timing_mod.median(self.conn)
+        timings_block: dict[str, Any] = {
+            "scry": {
+                "median_seconds": None if scry_median is None else round(scry_median, 3),
+                "samples": scry_samples,
+            },
+        }
+        if self.oracle_conn is not None:
+            oracle_median, oracle_samples = timing_mod.median(self.oracle_conn)
+            timings_block["oracle"] = {
+                "median_seconds": None if oracle_median is None else round(oracle_median, 3),
+                "samples": oracle_samples,
+            }
+
         body = {
             "status": status,
             "uptime_seconds": round((now - self.started_at).total_seconds(), 1),
@@ -1064,6 +1109,7 @@ class Engine:
         }
         if oracle_block is not None:
             body["oracle"] = oracle_block
+        body["timings"] = timings_block
         return body
 
 
